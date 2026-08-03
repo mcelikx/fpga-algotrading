@@ -1,0 +1,101 @@
+# =============================================================================
+# .gitignore — FPGA Algorithmic Trading System
+# -----------------------------------------------------------------------------
+# ⚠️ CREDENTIALS RULE (CLAUDE.md §6). No venue credentials, comp IDs, session
+#    IDs, MPIDs, or production IP addresses ever enter this repository. Real
+#    config is ignored; commit only the *.example.* templates.
+# =============================================================================
+
+# ── OS junk ──────────────────────────────────────────────────────────────────
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ── Simulation output (cocotb / Verilator / iverilog) ────────────────────────
+sim_build/
+obj_dir/
+results.xml
+*.vcd
+*.fst
+*.ghw
+*.shm/
+dump.vcd
+
+# ── Vivado / Vitis ───────────────────────────────────────────────────────────
+*.jou
+*.log
+*.str
+.Xil/
+.cache/
+.hw/
+.ip_user_files/
+*.runs/
+*.sim/
+*.gen/
+*.xpr
+*.bit
+*.ltx
+*.mmi
+*.rpt
+build/
+reports/
+# Keep the checked-in build scripts and constraints — only outputs are ignored.
+!scripts/*.tcl
+!constraints/*.xdc
+
+# ── Quartus ──────────────────────────────────────────────────────────────────
+db/
+incremental_db/
+output_files/
+*.qws
+*.sof
+
+# ── C++ / CMake (host/) ──────────────────────────────────────────────────────
+host/build/
+compile_commands.json
+*.o
+*.so
+*.a
+CMakeCache.txt
+CMakeFiles/
+
+# ── Market data ──────────────────────────────────────────────────────────────
+# Excluded for size, and because recorded exchange data is generally NOT
+# redistributable — see manuals/06-operations/04-testing-strategy.md and
+# tools/pcap/README.md. Corpus manifests are committed; the captures are not.
+*.pcap
+*.pcapng
+*.itch
+data/corpus/
+!tools/pcap/*.json
+
+# ── ⚠️ Secrets and live configuration ────────────────────────────────────────
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.secret
+credentials*
+host/config/*.yaml
+host/config/*.json
+!host/config/*.example.yaml
+!host/config/*.example.json
+
+# ── Local scratch ────────────────────────────────────────────────────────────
+scratch/
+tmp/
+*.bak
+*.orig
+*.rej
