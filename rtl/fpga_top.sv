@@ -20,23 +20,48 @@
 //   ITCH message assembly (to 512-bit beat)       2    12.8     134.8   fixed
 //   ITCH decode (fixed-offset extraction)         1     6.4     141.2   fixed
 //   Symbol filter + active-index map              1     6.4     147.6   fixed
-//   Order-ID map lookup (BRAM + out reg)          2    12.8     160.4   fixed
-//   Book level update + incremental top-of-book   2    12.8     173.2   var*
-//   Strategy parameter read + trigger             2    12.8     186.0   fixed
-//   Pre-trade risk gate                           2    12.8     198.8   fixed
-//   OUCH template read + splice + checksum        2    12.8     211.6   fixed
-//   TCP/SoupBinTCP framing                        1     6.4     218.0   fixed
-//   MAC TX (cut-through)                          2    12.8     230.8   fixed
-//   GT TX PCS/PMA + optics (hard IP)              -   ~90.0     320.8   fixed
+//   Book B0: input reg + early window check       1     6.4     154.0   fixed
+//   Book B1-B2: order-ID map (cuckoo, 2 buckets)  2    12.8     166.8   fixed
+//   Book B3-B4: price-level classify + RMW        2    12.8     179.6   fixed
+//   Book B5: incremental top-of-book              1     6.4     186.0   var*
+//   Book B6: output registration                  1     6.4     192.4   fixed
+//   Strategy parameter read + trigger             2    12.8     205.2   fixed
+//   Pre-trade risk gate                           2    12.8     218.0   fixed
+//   OUCH template read + splice + checksum        2    12.8     230.8   fixed
+//   TCP/SoupBinTCP framing                        1     6.4     237.2   fixed
+//   MAC TX (cut-through)                          2    12.8     250.0   fixed
+//   GT TX PCS/PMA + optics (hard IP)              -   ~90.0     340.0   fixed
 //   ---------------------------------------- -----   -----   -------
-//   FABRIC total                                 20   128.0
-//   WIRE-TO-WIRE target                           -       -     ~321    (< 1 us)
+//   FABRIC total                                 25   160.0
+//   WIRE-TO-WIRE target                           -       -     ~340    (< 1 us)
 //
 //   * The single variable-latency stage is a best-level delete that forces a
-//     new-best search. Bounded and counted; see book_engine.sv.
+//     new-best search. Bounded (+2 cycles typical) and counted; see
+//     book_engine.sv, whose header carries the cycle-accurate derivation of all
+//     seven book rows.
+//
+//   ⚠️ THE BOOK GREW FROM 4 ROWS TO 7 AND THE BUDGET IS RESTATED, NOT HIDDEN.
+//      The three extra cycles buy: a 2048-level window instead of 16 (the book
+//      no longer freezes when a symbol moves 8 cents), an O(1)-worst-case cuckoo
+//      lookup with an overflow region instead of a table that dies at 12.5 %
+//      load, and the early window check that makes the map and the level array
+//      hold the same population by construction. 19.2 ns for a book that works
+//      is not a regression; a 128 ns budget for a book that publishes a $0.00
+//      bid is not an achievement. docs/ORDER-BOOK-REDESIGN.md §2.
 //
 // RESOURCE BUDGET (target, VU9P-class, fast path only, one SLR)
-//   LUT  < 60k   FF < 90k   BRAM < 300   URAM < 64   DSP < 16
+//   LUT  < 60k   FF < 90k   BRAM < 300   URAM < 200
+//   ⚠️ URAM was < 64 and that was written for a 16-level book. The order book
+//      alone now accounts for 160 URAM288 (128 level array + 32 order map) and
+//      the full SLR arithmetic — 163 of ~320, 51 % — is recorded in
+//      rtl/pkg/trading_pkg.sv §"SLR CAPACITY". It fits with room; the ceiling
+//      above is set at 200 so a map re-sizing from measured ITCH statistics has
+//      somewhere to go before it has to displace something.
+//   ⚠️ THE FF FIGURE IS NOT CREDIBLE AND IS FLAGGED RATHER THAN ADJUSTED.
+//      top_of_book's best + second-best register file is ~78 kFF on its own at
+//      N_ACTIVE = 256, and strategy_engine estimates ~18.7 kFF. FF < 90k cannot
+//      hold both. Re-derive the FF budget from a synthesis run before treating
+//      any of these numbers as a gate.   DSP < 16
 // -----------------------------------------------------------------------------
 // HARD RULES ENFORCED HERE (CLAUDE.md §5)
 //   1. RX path has NO backpressure. s_axis_rx_tready is tied high, always.
@@ -220,7 +245,13 @@ module fpga_top
     sym_idx_t               sym_state_idx;
     trade_state_e           sym_state_val;
     logic                   sym_ssr_val;
-    price_t                 sym_luld_lo, sym_luld_hi;
+    // ⚠️ ITCH message 'J' carries AUCTION COLLARS, not live LULD bands. The live
+    //    bands come from the SIP, which this design does not consume, and are
+    //    host-written into the risk parameter table instead. Naming these
+    //    'luld' is precisely how the original defect hid — a symbol whose bands
+    //    sat at 0/0 while the fail-closed risk gate rejected every order.
+    //    See docs/SYSTEM-REPORT.md defect 1.
+    price_t                 sym_auc_collar_lo, sym_auc_collar_hi;
 
     feed_handler u_feed (
         .clk            (core_clk),
@@ -240,8 +271,8 @@ module fpga_top
         .sym_state_idx  (sym_state_idx),
         .sym_state_val  (sym_state_val),
         .sym_ssr_val    (sym_ssr_val),
-        .sym_luld_lo    (sym_luld_lo),
-        .sym_luld_hi    (sym_luld_hi),
+        .sym_luld_lo    (sym_auc_collar_lo),
+        .sym_luld_hi    (sym_auc_collar_hi),
         // Host-loaded locate -> active-index filter table
         .cfg_clk        (core_clk),
         .cfg_filter_wr  (cfg_filter_wr),
@@ -257,11 +288,58 @@ module fpga_top
     logic                   book_top_valid;
     logic [31:0]            book_stat [16];
 
+    // ── Host per-symbol reference price (the window anchor) ──────────────────
+    // ⚠️ THE BOOK IS INERT WITHOUT THIS. price_levels is host-anchored and fails
+    //    closed: a symbol with no reference price rejects every update, stales
+    //    itself and asks to be re-anchored. That is deliberate — a guessed
+    //    window is what silently froze the previous book — but it makes this
+    //    port mandatory plumbing, not an optional feature.
+    //    See rtl/book/book_engine.sv §"HOST ANCHOR" and
+    //    manuals/04-system-architecture/03-order-book-in-hardware.md §4.
+    //
+    // REGISTER MAP ADDITION THE HOST SOFTWARE NEEDS
+    //   No new BAR register. A new REGION inside the existing STRAT config
+    //   window (BAR offset 0x300), which is the only window deliberately NOT
+    //   write-protected while trading is enabled — it already carries a
+    //   per-symbol price the host refreshes at millisecond cadence
+    //   (sym_strat_t.fair_value), which is exactly this port's cadence.
+    //
+    //     STRAT_ADDR (0x300) <= 16'h6000 | sym      // region 3'b011, sym[7:0]
+    //     STRAT_DATA (0x304) <= ref_px              // ITCH units, 4 implied
+    //                                               // decimals, WHOLE TICK
+    //
+    //   No commit pulse: the anchor applies per symbol on its own handshake and
+    //   is not double-buffered. A sub-tick reference is REJECTED and counted
+    //   (book stat[15] bit 12) rather than anchoring the window off-grid.
+    //
+    // ⚠️ ONE FOLLOW-UP IS REQUIRED OUTSIDE THIS FILE, AND IT IS NOT COSMETIC.
+    //    strategy_engine decodes cfg_param_addr[15:13] and COUNTS every region
+    //    it does not recognise as a bad address (cfg_bad_addr_cnt_q). Region
+    //    3'b011 is now legitimate traffic, so that counter must be taught about
+    //    it or it reports a false host-addressing fault on every re-anchor —
+    //    a telemetry lie that would mask a real addressing bug. One line, in
+    //    rtl/strategy/strategy_engine.sv:
+    //        (cfg_region != book_pkg::BOOK_CFG_REGION) &&
+    //    plus the matching constant in rtl/strategy/strategy_pkg.sv. Both files
+    //    are outside this task's write scope, so it is stated, not done.
+    logic     book_cfg_valid, book_cfg_ready;
+    sym_idx_t book_cfg_sym;
+    price_t   book_cfg_px;
+
+    assign book_cfg_valid = cfg_strat_wr
+                         && (cfg_strat_addr[15:13] == book_pkg::BOOK_CFG_REGION);
+    assign book_cfg_sym   = cfg_strat_addr[ACT_IDX_W-1:0];
+    assign book_cfg_px    = cfg_strat_data;
+
     book_engine u_book (
         .clk            (core_clk),
         .rst            (core_rst),
         .s_evt          (book_evt),
         .s_evt_valid    (book_evt_valid),
+        .cfg_ref_valid  (book_cfg_valid),
+        .cfg_ref_sym    (book_cfg_sym),
+        .cfg_ref_px     (book_cfg_px),
+        .cfg_ref_ready  (book_cfg_ready),
         .m_top          (book_top),
         .m_top_valid    (book_top_valid),
         .stat           (book_stat)
@@ -330,8 +408,8 @@ module fpga_top
         .sym_state_idx    (sym_state_idx),
         .sym_state_val    (sym_state_val),
         .sym_ssr_val      (sym_ssr_val),
-        .sym_luld_lo      (sym_luld_lo),
-        .sym_luld_hi      (sym_luld_hi),
+        .sym_auc_collar_lo(sym_auc_collar_lo),
+        .sym_auc_collar_hi(sym_auc_collar_hi),
         .book_top         (book_top),
         .book_top_valid   (book_top_valid),
         // Kill switch
@@ -583,6 +661,17 @@ module fpga_top
     assert property (@(posedge core_clk) disable iff (core_rst)
         (book_top_valid && book_top.stale) |=> !order_req_valid
     ) else $error("order requested on a stale book");
+
+    // The host config path has no backpressure, so book_engine's cfg_ref_ready
+    // cannot be obeyed — it exists to be CHECKED. The structural claim is that
+    // the PCIe->core handshake (~8 pcie + ~6 core cycles per write, host_ctrl
+    // CDC #7) cannot deliver two reference-price writes inside price_levels'
+    // 4-cycle configuration FSM. If this ever fires, a symbol is anchored to a
+    // price the host does not believe it wrote, which is worse than not being
+    // anchored at all: the book would look alive and be wrong.
+    assert property (@(posedge core_clk) disable iff (core_rst)
+        book_cfg_valid |-> book_cfg_ready
+    ) else $error("FATAL: host reference-price write dropped — book window anchored to an unknown base");
 `endif
 
 endmodule : fpga_top
