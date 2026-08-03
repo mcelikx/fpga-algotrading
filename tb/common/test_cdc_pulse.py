@@ -722,7 +722,11 @@ if __name__ == "__main__":  # pragma: no cover
                 "rtl/common/cdc_sync_bit.sv", "rtl/common/cdc_pulse.sv"),
             hdl_toplevel="cdc_pulse",
             parameters={"SYNC_STAGES": stages},
-            build_args=["-Wno-fatal", "--timescale-override", "1ns/1ps"],
+            # --timing: the RTL uses delay controls that Verilator refuses to
+            # compile without an explicit timing mode (NEEDTIMINGOPT).
+            # tb/common/Makefile passes it, which is why this module built under
+            # that path and not under this runner.
+            build_args=["-Wno-fatal", "--timing", "--timescale-override", "1ns/1ps"],
             always=True,
         )
         runner.test(hdl_toplevel="cdc_pulse", test_module="test_cdc_pulse")

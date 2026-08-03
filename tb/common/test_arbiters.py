@@ -709,16 +709,40 @@ if __name__ == "__main__":  # pragma: no cover
 
     runner = get_runner(os.environ.get("SIM", "verilator"))
 
+    # ⚠️ A failing test here can take the SIMULATOR down, not just the test:
+    # rtl/common/fixed_arbiter.sv:193's $error calls $stop. Run every
+    # parameterisation anyway and re-raise at the end, so one aborting
+    # configuration does not leave the later ones unmeasured — an unrun
+    # parameterisation is not a passing one, and silently skipping it is how a
+    # matrix comes to mean less than it looks like it does.
+    _failed: list[str] = []
+
+    def _run(tag, **kw):
+        try:
+            runner.test(**kw)
+        # ⚠️ SystemExit too, NOT just Exception: cocotb's runner reports a failed
+        # simulation by exiting, and SystemExit derives from BaseException, so a
+        # bare `except Exception` silently lets the whole sweep die on the first
+        # bad configuration — which is the behaviour this wrapper exists to stop.
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - reported below
+            _failed.append(f"{tag}: {type(exc).__name__}: {exc}")
+            print(f"!!! configuration FAILED: {tag} — continuing to the next one")
+
     for n in (2, 4, 8):
         runner.build(
             verilog_sources=sim_sources("rtl/common/rr_arbiter.sv"),
             hdl_toplevel="rr_arbiter",
             parameters={"N": n},
-            build_args=["-Wno-fatal"],
+            # --timing: the RTL uses delay controls that Verilator refuses to
+            # compile without an explicit timing mode (NEEDTIMINGOPT).
+            # tb/common/Makefile passes it, which is why these modules built
+            # under that path and not under this runner.
+            build_args=["-Wno-fatal", "--timing"],
             always=True,
         )
         os.environ["TOPLEVEL"] = "rr_arbiter"
-        runner.test(hdl_toplevel="rr_arbiter", test_module="test_arbiters")
+        _run(f"rr_arbiter N={n}",
+             hdl_toplevel="rr_arbiter", test_module="test_arbiters")
 
     # STARVE_W=8 is the minimum the module allows and the only width at which
     # saturation is reachable in simulation. STARVE_W=32 is the default and is
@@ -728,8 +752,16 @@ if __name__ == "__main__":  # pragma: no cover
             verilog_sources=sim_sources("rtl/common/fixed_arbiter.sv"),
             hdl_toplevel="fixed_arbiter",
             parameters={"N": n, "STARVE_W": sw},
-            build_args=["-Wno-fatal"],
+            # --timing: see the rr_arbiter build above.
+            build_args=["-Wno-fatal", "--timing"],
             always=True,
         )
         os.environ["TOPLEVEL"] = "fixed_arbiter"
-        runner.test(hdl_toplevel="fixed_arbiter", test_module="test_arbiters")
+        _run(f"fixed_arbiter N={n} STARVE_W={sw}",
+             hdl_toplevel="fixed_arbiter", test_module="test_arbiters")
+
+    if _failed:
+        print("\n=== configurations that failed ===")
+        for line in _failed:
+            print(f"  {line}")
+        sys.exit(1)

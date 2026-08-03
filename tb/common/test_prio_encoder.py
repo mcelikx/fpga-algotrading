@@ -188,10 +188,35 @@ def _drive_inputs(dut, vec: int) -> None:
         dut.grp_sum_in.value = group_summary(vec, GEO["n"], GEO["gw"])
 
 
+#: The task driving ``clk``.
+#:
+#: ⚠️ cocotb runs every test in this file inside ONE simulation, but it does NOT
+#: let a task outlive the test that started it. cocotb 2.0 cancels every task a
+#: test spawned the moment that test ends (``cocotb/_test.py``: "Set outcome and
+#: cancel Tasks"). A clock started once, under an ``if not GEO`` first-test-only
+#: guard, therefore stops the instant the first test passes: from the second
+#: test onward nothing toggles ``clk``, Verilator runs out of scheduled events
+#: one half-period later and exits, and cocotb reports every remaining test as
+#: ``SimFailure: Simulator shut down prematurely`` at 0.00 ns of sim time.
+#:
+#: So the clock is (re)started per test, and any predecessor is cancelled first
+#: so two tasks can never drive ``clk`` in the same timestep — the same shape
+#: test_sync_fifo.py and test_counter_bank.py already use.
+_CLOCK: list = []
+
+
+def _start_clock(dut) -> None:
+    while _CLOCK:
+        task = _CLOCK.pop()
+        if not task.done():
+            task.cancel()
+    _CLOCK.append(start_clock(dut, "clk", CLK_NS))
+
+
 async def bringup(dut):
     """Clock, reset, and — once — discover the DUT's latency and direction."""
+    _start_clock(dut)
     if not GEO:
-        start_clock(dut, "clk", CLK_NS)
         GEO["n"] = len(dut.req)
         GEO["idx_w"] = len(dut.idx)
         GEO["ng"] = len(dut.grp_sum_in) if hasattr(dut, "grp_sum_in") else 1

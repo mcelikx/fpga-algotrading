@@ -335,8 +335,23 @@ async def test_integrity_under_random_stalls(dut):
     """Constrained-random producer/consumer stalling, deterministic seed.
 
     Directed patterns find the shapes you thought of; this finds the rest.  The
-    producer also randomly withdraws ``s_valid`` between beats, which is legal
-    and must not disturb anything held in the skid register.
+    producer also leaves random GAPS between beats — cycles where it offers
+    nothing — which is legal and must not disturb anything held in the skid
+    register.
+
+    ⚠️ A gap is only legal BETWEEN beats.  ``rtl/common/skid_buffer.sv``'s header
+    states the interface contract this module is entitled to assume, and asserts
+    it at line 127:
+
+        1. Once `valid` is asserted it must not de-assert until a transfer
+           completes.
+        2. `data` must be stable while `valid && !ready`.
+
+    So a beat that has been offered and not yet accepted must be HELD — same
+    ``s_valid``, same ``s_data`` — until ``s_ready`` takes it.  Re-rolling the
+    offer every cycle withdraws un-accepted beats and trips the module's own
+    input-contract assertion, which is a defect in the stimulus, not in the DUT.
+    ``_run_pattern`` above holds ``s_valid`` for exactly this reason.
     """
     rng, seed = seeded_rng(dut, "skid.random")
     s, m = await bringup(dut, seed)
@@ -345,14 +360,17 @@ async def test_integrity_under_random_stalls(dut):
     sent, recvd = [], []
     word = 0
     guard = 0
+    offering = False        # a beat offered and not yet accepted — must be held
     while len(recvd) < n:
         guard += 1
         assert guard < n * 50 + 1000, (
             f"deadlock: {len(recvd)}/{n} beats after {guard} cycles" + seed_note(seed)
         )
-        offer = word < n and rng.random() < 0.75
-        dut.s_valid.value = int(offer)
-        if offer:
+        # Roll a new offer only when none is outstanding; hold an outstanding one.
+        if not offering:
+            offering = word < n and rng.random() < 0.75
+        dut.s_valid.value = int(offering)
+        if offering:
             dut.s_data.value = word
         dut.m_ready.value = int(rng.random() < 0.6)
 
@@ -365,6 +383,7 @@ async def test_integrity_under_random_stalls(dut):
         if s_fire:
             sent.append(word)
             word += 1
+            offering = False
         if m_fire:
             recvd.append(m_word)
 
@@ -399,11 +418,24 @@ async def test_reset_mid_transaction_discards_cleanly(dut):
 
     for stall_before_reset in range(0, 6):
         # Fill the buffer: offer beats with the consumer stalled.
+        #
+        # ⚠️ Only TWO beats can be accepted with `m_ready` low (output register
+        # + skid slot); after that `s_ready` falls and the third beat sits
+        # un-accepted at the input. Contract rule 2 (skid_buffer.sv header) says
+        # `s_data` must be STABLE while `s_valid && !s_ready`, so the offered
+        # word may only advance on a cycle the DUT actually took it. Advancing
+        # it every cycle regardless — as this loop used to — moves data under a
+        # stalled handshake and trips the module's input-contract assertion.
         dut.m_ready.value = 0
         dut.s_valid.value = 1
-        for k in range(4):
+        k = 0
+        for _ in range(4):
             dut.s_data.value = 0xDEAD_0000 + k
+            await ReadOnly()
+            accepted = int(dut.s_ready.value)
             await RisingEdge(dut.clk)
+            if accepted:
+                k += 1
         await ClockCycles(dut.clk, stall_before_reset)
 
         dut.rst.value = 1
@@ -472,7 +504,11 @@ if __name__ == "__main__":  # pragma: no cover
     runner.build(
         verilog_sources=sim_sources("rtl/common/skid_buffer.sv"),
         hdl_toplevel="skid_buffer",
-        build_args=["-Wno-fatal"],
+        # --timing: the RTL uses delay controls that Verilator refuses to
+        # compile without an explicit timing mode (NEEDTIMINGOPT).
+        # tb/common/Makefile passes it, which is why this module built under
+        # that path and not under this runner.
+        build_args=["-Wno-fatal", "--timing"],
         always=True,
     )
     runner.test(hdl_toplevel="skid_buffer", test_module="test_skid_buffer")
