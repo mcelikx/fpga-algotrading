@@ -99,3 +99,12 @@ tmp/
 *.bak
 *.orig
 *.rej
+
+# ── ⚠️ Third-party reference material — NOT redistributed ────────────────────
+# reference/ holds clones of external projects kept locally for study.
+# adamwalker/fpga-hashmap is AGPL-3.0, which is incompatible with this repo's
+# MIT licence in the direction that matters: adapting it into rtl/ would force
+# the whole project to AGPL, and AGPL section 13 requires source disclosure to
+# network users. Kept local, never committed.
+# Analysis in our own words: docs/REFERENCE-fpga-hashmap.md
+reference/
