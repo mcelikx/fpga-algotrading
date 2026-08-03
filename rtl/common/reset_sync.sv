@@ -107,8 +107,24 @@ module reset_sync #(
 
     // Release is monotonic: once released, reset may only re-assert via
     // async_rst_in. Catches a shift-register that got wired backwards.
+    // ⚠️ A DIFFERENT failure from the recovery-edge hole in sync_fifo.sv, and a
+    //    subtler one. `async_rst_in` is asynchronous by design: a pulse narrower
+    //    than a clock period legitimately asserts `sync_rst_out` and is then
+    //    INVISIBLE to clock-edge sampling. The original property saw
+    //    async_rst_in low at both sample points, observed sync_rst_out high, and
+    //    called it spurious — flagging the module for doing exactly its job.
+    //
+    //    A property may not sample an asynchronous event at clock resolution and
+    //    conclude it did not happen. Latch the pulse so the check can see what
+    //    actually occurred. Simulation-only; no synthesizable logic changes.
+    logic async_seen;
+    always_ff @(posedge clk or posedge async_rst_in)
+        if (async_rst_in) async_seen <= 1'b1;
+        else              async_seen <= 1'b0;
+
     assert property (@(posedge clk)
-        (!async_rst_in && !sync_rst_out) |=> (async_rst_in || !sync_rst_out))
+        (!async_rst_in && !async_seen && !sync_rst_out)
+            |=> (async_rst_in || async_seen || !sync_rst_out))
         else $error("reset_sync: spurious re-assertion of sync_rst_out");
 `endif
 

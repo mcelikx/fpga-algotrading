@@ -188,8 +188,11 @@ module fixed_arbiter #(
 
     // Counters saturate rather than wrap — the whole point of §9.
     for (a = 0; a < int'(N); a++) begin : g_sat
+        // ⚠️ Same recovery-edge hole as sync_fifo.sv: the cycle after
+        //    rst/starve_clr de-asserts still evaluates against a $past() taken
+        //    before the clear. Guard on the previous cycle too.
         assert property (@(posedge clk) disable iff (rst || starve_clr)
-            starve_cnt[a] >= $past(starve_cnt[a]))
+            $past(!(rst || starve_clr)) |-> (starve_cnt[a] >= $past(starve_cnt[a])))
             else $error("fixed_arbiter: starve_cnt[%0d] WRAPPED — a wrapped counter reads as healthy", a);
 
         assert property (@(posedge clk) disable iff (rst || starve_clr)

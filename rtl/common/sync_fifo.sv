@@ -224,8 +224,14 @@ module sync_fifo #(
         else $error("sync_fifo: sticky underflow flag cleared without err_clr");
 
     // High-water mark is monotonic and bounded.
+    // ⚠️ `disable iff (rst)` suppresses this WHILE reset is high, but the first
+    //    cycle after release still evaluates, comparing the freshly-cleared
+    //    high_water against $past() from before the reset. A legal 1-cycle reset
+    //    then reads as a decrease. Guard on the PREVIOUS cycle also being out of
+    //    reset, so the recovery edge is covered. See counter_bank.sv for the
+    //    implication form that gets this right by construction.
     assert property (@(posedge clk) disable iff (rst)
-        high_water >= $past(high_water))
+        $past(!rst) |-> (high_water >= $past(high_water)))
         else $error("sync_fifo: high-water mark decreased");
 
     assert property (@(posedge clk) disable iff (rst)
