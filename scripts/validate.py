@@ -168,20 +168,87 @@ def check_links(files: list[Path], rep: Report) -> None:
 
 # ── 3. RTL discipline (CLAUDE.md §4 / §5) ────────────────────────────────────
 RTL_RULES = [
-    # (regex, severity, message)
-    (re.compile(r"^\s*always\s*@"), "error",
+    # (rule-name, regex, severity, message)
+    # rule-name is what an author writes in `// validate: allow <name> — why`
+    ("bare-always", re.compile(r"^\s*always\s*@"), "error",
      "bare `always` — use always_ff or always_comb (manuals/00-foundations/03 §2)"),
-    (re.compile(r"^\s*(?:input|output|inout)?\s*\breg\b\s"), "error",
+    ("reg-decl", re.compile(r"^\s*(?:input|output|inout)?\s*\breg\b\s"), "error",
      "`reg` declaration — use `logic` (manuals/00-foundations/03 §4)"),
-    (re.compile(r"\breal\b|\bshortreal\b"), "error",
+    ("real", re.compile(r"\breal\b|\bshortreal\b"), "error",
      "floating point type — fast path is fixed-point only (CLAUDE.md §5.3)"),
-    (re.compile(r"[^/*]\s/\s(?!/)"), "warn",
+    ("divide", re.compile(r"[^/*]\s/\s(?!/)"), "warn",
      "possible division — no dividers on the fast path (manuals/00-foundations/03 §7)"),
-    (re.compile(r"\s%\s"), "warn",
+    ("modulo", re.compile(r"\s%\s"), "warn",
      "possible modulo — no dividers on the fast path (manuals/00-foundations/03 §7)"),
 ]
 
 REQUIRED_HEADER_TOKENS = ["LATENCY", "manual"]
+
+
+def _strip_comments(text: str) -> str:
+    """Blank out comments while preserving offsets and line count.
+
+    Required before any structural scan of HDL. Prose inside comments contains
+    keywords — "end of frame", "in the default case" — and a scanner that counts
+    `begin`/`end` depth over raw text will silently mis-parse the block, then
+    report a violation in code that is perfectly correct.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+        elif text[i] in "\"":
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            for k in range(i, min(j + 1, n)):
+                out[k] = " "
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _synthesis_excluded(lines: list[str]) -> list[bool]:
+    """Mark lines sitting inside an `ifndef SYNTHESIS` / `ifdef SIMULATION` block.
+
+    Code that never reaches synthesis is not bound by the synthesizable-subset
+    rules. A concurrent assertion on a purely combinational module, for example,
+    legitimately needs a bare `always` because there is no clock to attach to.
+    """
+    out, depth, sim_depth = [], 0, 0
+    for line in lines:
+        s = line.strip()
+        if re.match(r"`(ifndef\s+SYNTHESIS|ifdef\s+SIMULATION)\b", s):
+            sim_depth += 1
+            depth += 1
+        elif re.match(r"`if(n?def)\b", s):
+            depth += 1
+        elif re.match(r"`endif\b", s):
+            if sim_depth and depth == sim_depth:
+                sim_depth -= 1
+            depth = max(0, depth - 1)
+        out.append(sim_depth > 0)
+    return out
+
+
+# An author may suppress a rule on a line, or file-wide in the header, with
+#   // validate: allow <rule> — <justification>
+# The justification is mandatory: a suppression without a stated reason is
+# itself reported, so silencing a check always leaves an auditable trace.
+SUPPRESS_RE = re.compile(r"//\s*validate:\s*allow\s+([a-z-]+)\s*(?:[—-]\s*(.+))?$")
 
 
 def check_rtl(files: list[Path], rep: Report) -> None:
@@ -193,28 +260,78 @@ def check_rtl(files: list[Path], rep: Report) -> None:
         text = p.read_text(errors="replace")
         lines = text.splitlines()
         is_pkg = "/pkg/" in str(rel) or rel.name.endswith("_pkg.sv")
+        sim_only = _synthesis_excluded(lines)
         if re.search(r"^\s*module\s", text, re.M):
             modules += 1
 
+        # File-wide suppressions declared in the first 60 lines.
+        file_allow: set[str] = set()
+        for line in lines[:60]:
+            m = SUPPRESS_RE.search(line)
+            if m:
+                if not (m.group(2) or "").strip():
+                    rep.findings.append(asdict(Finding(
+                        "warn", "suppression", str(rel),
+                        f"`validate: allow {m.group(1)}` with no justification — "
+                        "state why, so the exemption is auditable")))
+                file_allow.add(m.group(1))
+
         for i, line in enumerate(lines, 1):
+            if sim_only[i - 1]:
+                continue                      # not synthesized, rules do not apply
             stripped = line.split("//")[0]
             if not stripped.strip():
                 continue
-            for rx, sev, msg in RTL_RULES:
-                # div/mod warnings are noisy in packages doing width math
+            local = SUPPRESS_RE.search(line)
+            allow = set(file_allow) | ({local.group(1)} if local else set())
+            for rule, rx, sev, msg in RTL_RULES:
+                if rule in allow:
+                    continue
+                # div/mod warnings are noisy in packages doing elaboration math
                 if sev == "warn" and is_pkg:
+                    continue
+                # `real` is legitimate on localparams feeding a vendor primitive
+                # that declares them `real` (MMCM/PLL). Only flag it on signals.
+                if rule == "real" and re.match(r"\s*(local)?param(eter)?\s+real\s", stripped):
                     continue
                 if rx.search(stripped):
                     rep.findings.append(asdict(Finding(
                         sev, "rtl-discipline", f"{rel}:{i}", msg)))
 
-        # always_comb without a default assignment is the latch trap
-        for m in re.finditer(r"always_comb\s+begin(.{0,400}?)end", text, re.S):
-            body = m.group(1)
-            if "case" in body and "default" not in body:
+        # always_comb containing a `case` with no `default` is the latch trap.
+        # Scan by begin/end depth rather than a fixed character window — a short
+        # window truncates long bodies and reports a `default` that is really
+        # there, which is worse than not checking at all.
+        code = _strip_comments(text)
+        for m in re.finditer(r"\balways_comb\b", code):
+            if sim_only[code[:m.start()].count("\n")]:
+                continue
+            depth, i, n, body = 0, m.end(), len(code), []
+            started = False
+            while i < n:
+                word = re.match(r"\b(begin|endcase|end|case[xz]?)\b", code[i:])
+                if word:
+                    w = word.group(1)
+                    if w == "begin":
+                        depth += 1
+                        started = True
+                    elif w == "end":
+                        depth -= 1
+                        if started and depth <= 0:
+                            break
+                    i += len(w)
+                    body.append(w)
+                    continue
+                if not started and code[i] == ";":
+                    break                     # single-statement always_comb
+                body.append(code[i])
+                i += 1
+            blob = "".join(body)
+            if re.search(r"\bcase[xz]?\b", blob) and not re.search(r"\bdefault\b", blob):
                 latch_risk += 1
+                ln = code[:m.start()].count("\n") + 1
                 rep.findings.append(asdict(Finding(
-                    "error", "latch-risk", str(rel),
+                    "error", "latch-risk", f"{rel}:{ln}",
                     "always_comb contains a `case` with no `default` — latch inference "
                     "(manuals/00-foundations/03 §3)")))
 
