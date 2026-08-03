@@ -15,11 +15,27 @@
 //
 // -----------------------------------------------------------------------------
 // ⚠️ THE HAZARD THIS MODULE EXISTS TO PREVENT
-//   sym_risk_t is 324 bits. The host bus is 32 bits. A naive table takes 11
+//   sym_risk_t is 327 bits. The host bus is 32 bits. A naive table takes 11
 //   writes to update a record, and an order evaluated between write 4 and write 5
 //   sees the NEW max_order_qty against the OLD collar. That is not a tighter
 //   limit and it is not a looser limit — it is an UNDEFINED limit, and it is
 //   undefined for a window measured in microseconds of live market data.
+//
+// ⚠️ THIS TABLE IS NOW ALSO THE LULD BAND SOURCE.
+//   `sym_risk_t.luld_lo` / `.luld_hi` / `.luld_valid` are the AUTHORITATIVE
+//   continuous LULD bands, written by the host from the SIP. They were
+//   previously taken from the feed handler's decode of ITCH `J`, which carries
+//   reopening-AUCTION COLLARS, not bands — so they sat at 0/0 and the fail-closed
+//   risk gate rejected every order all day. Consequences for this module:
+//     * a band update is a full record commit: 11 words, CRC, sanity, one atomic
+//       324→327-bit write. At ~25 cycles it is 160 ns of slow path per symbol per
+//       band move, which is nothing next to the band update rate;
+//     * band moves are therefore CRC-checked, counted, read-backable and
+//       governed exactly like every other limit, which is the correct treatment
+//       for an input to a 15c3-5 pre-trade control;
+//     * `commit_done` is what stamps band freshness in risk_gate. A commit that
+//       fails CRC or sanity does NOT pulse it, so a failed band update ages out
+//       and the symbol stops trading rather than trading on the old band.
 //
 //   Structure (identical discipline to the strategy parameter table):
 //
@@ -58,6 +74,12 @@
 //   counter that telemetry alarms on, not a soft log line. (09-*.md §6.)
 //
 // ⚠️ FAIL-CLOSED RESET STATE
+//   An ALL-ZERO record is disabled, has every limit at zero, has NO LULD bands
+//   loaded (`luld_valid = 0`) and NO pricing increment configured
+//   (`tick_class = TICK_UNSET`). The sanity gate below refuses it, so it can
+//   never become evaluable. Reset semantics are unchanged by the new fields:
+//   all-zero still means "cannot trade", in one more way than before.
+//
 //   `params_valid[*] = 0`. active_mem contents are undefined-but-unreachable:
 //   risk_gate rejects any order for a symbol with params_valid = 0 with
 //   RISK_PARAM_INVALID, so an unwritten record can never be evaluated against.
@@ -92,7 +114,7 @@
 //   Read-back      : 2 cycles.
 //
 // RESOURCE (estimate, pre-synthesis, VU9P-class, N_ACTIVE=256)
-//   active_mem : 256 × 324b  =  83 kbit  →  ~5 BRAM36  (or 1 URAM)
+//   active_mem : 256 × 327b  =  84 kbit  →  ~5 BRAM36  (or 1 URAM)
 //   shadow_mem : 4096 × 32b  = 131 kbit  →  ~4 BRAM36
 //   LUT ~900   FF ~800   BRAM ~9   DSP 0
 //
@@ -161,7 +183,11 @@ module risk_params
     // -------------------------------------------------------------------------
     // Geometry
     // -------------------------------------------------------------------------
-    localparam int unsigned SYM_RISK_W = $bits(sym_risk_t);              // 324
+    localparam int unsigned SYM_RISK_W = $bits(sym_risk_t);              // 327
+    // ⚠️ Still 11 words after the tick_class / luld_valid additions, so the
+    // host's commit sequence length and the CRC coverage are unchanged — only
+    // the bit layout inside the words moved. The `initial` check below is what
+    // catches the day that stops being true.
     localparam int unsigned N_WORDS    = (SYM_RISK_W + 31) / 32;         // 11
     localparam int unsigned REC_PAD_W  = N_WORDS * 32;                   // 352
     localparam int unsigned SHADOW_D   = N_SYM * 16;                     // 4096
@@ -200,8 +226,25 @@ module risk_params
         // Position bounds are stored as non-negative magnitudes.
         if (r.max_long_pos       <  position_t'(0))  ok = 1'b0;
         if (r.max_short_pos      <  position_t'(0))  ok = 1'b0;
-        // LULD bands: if either is set, both must be, and ordered.
-        if ((r.luld_lo != price_t'(0)) || (r.luld_hi != price_t'(0))) begin
+        // ⚠️ SEC Rule 612: a symbol with no minimum pricing increment, or with a
+        // reserved encoding, is not evaluable. It is NOT "assume pennies" — the
+        // whole point of making the tick per-symbol is that the fabric no longer
+        // has a default regime to fall back on. Rejecting here means such a
+        // record never becomes evaluable at all, rather than being caught
+        // per-order at the gate. (The gate rejects it too, as defence in depth.)
+        if (r.tick_class == TICK_UNSET)              ok = 1'b0;
+        if (r.tick_class == TICK_RSVD)               ok = 1'b0;
+        // ⚠️ LULD bands. `luld_valid` is the host asserting "these are the live
+        // SIP bands for this symbol". If it asserts that, the bands must actually
+        // be a band: both endpoints present and correctly ordered. A record
+        // claiming valid bands of 0/0 would make every order fail on price with
+        // RISK_LULD_BAND and look like a market event; it is a control-plane bug
+        // and is stopped here, where it is counted as `sane_fail_cnt`.
+        // When luld_valid = 0 the band fields are not constrained — the gate
+        // rejects with RISK_LULD_NOT_LOADED regardless of what they hold, and
+        // forcing the host to zero them would break the legitimate pattern of
+        // retaining the last known band for read-back while marking it unusable.
+        if (r.luld_valid) begin
             if (r.luld_lo == price_t'(0))            ok = 1'b0;
             if (r.luld_hi == price_t'(0))            ok = 1'b0;
             if (r.luld_lo >  r.luld_hi)              ok = 1'b0;
@@ -508,8 +551,35 @@ module risk_params
         (commit_busy && commit) |=> $stable(csym_q)
     ) else $error("a commit pulse corrupted an in-progress commit");
 
+    // ⚠️ A valid record always has an evaluable Rule 612 increment, and if it
+    //    claims LULD bands they are a real, ordered band. Re-derived from the
+    //    stored record rather than from param_sane, so a bug in the sanity gate
+    //    itself cannot hide behind its own logic.
+    // The committed record as stored, re-read from the active bank.
+    sym_risk_t act_rec;
+    assign act_rec = sym_risk_t'(active_mem[csym_q]);
+
+    a_valid_tick : assert property (@(posedge clk) disable iff (rst)
+        params_valid_q[csym_q] |-> ((act_rec.tick_class != TICK_UNSET)
+                                 && (act_rec.tick_class != TICK_RSVD))
+    ) else $error("FATAL: a record with no Rule 612 increment was marked valid");
+
+    a_valid_band : assert property (@(posedge clk) disable iff (rst)
+        (params_valid_q[csym_q] && act_rec.luld_valid)
+        |-> ((act_rec.luld_lo != price_t'(0))
+          && (act_rec.luld_lo <= act_rec.luld_hi))
+    ) else $error("FATAL: a record claiming LULD bands was marked valid with no usable band");
+
     // ⚠️ REQUIRED COVERAGE — every path observed.
     c_commit_ok   : cover property (@(posedge clk) disable iff (rst) commit_done);
+    c_sane_tick   : cover property (@(posedge clk) disable iff (rst)
+                                     (cstate_q == C_WR) && !cand_sane
+                                     && (cand_rec.tick_class == TICK_UNSET));
+    c_sane_band   : cover property (@(posedge clk) disable iff (rst)
+                                     (cstate_q == C_WR) && !cand_sane
+                                     && cand_rec.luld_valid);
+    c_band_commit : cover property (@(posedge clk) disable iff (rst)
+                                     commit_done && cand_rec.luld_valid);
     c_commit_crc  : cover property (@(posedge clk) disable iff (rst) cstate_q == C_FAIL);
     c_commit_sane : cover property (@(posedge clk) disable iff (rst)
                                      (cstate_q == C_WR) && !cand_sane);

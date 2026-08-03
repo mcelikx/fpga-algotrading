@@ -30,11 +30,12 @@
 //
 //     T0 (1 cyc) : ALL cheap checks evaluated IN PARALLEL from a pre-fetched
 //                  parameter/state/position record; two DSP multiplies launched
-//                  (order notional, and the Rule 612 divide-by-100 reciprocal).
-//                  Results registered as a 24-bit failure vector.
-//     T1 (1 cyc) : the four arithmetic checks that consume the DSP results,
-//                  ORed into the vector; priority-encode the reason; register
-//                  the output.
+//                  (order notional, and the Rule 612 divide-by-100 reciprocal,
+//                  reduced to the 7-bit residue px mod 100). Results registered
+//                  as a 26-bit failure vector.
+//     T1 (1 cyc) : the arithmetic checks that consume the DSP results, plus the
+//                  per-symbol tick-class lookup on the residue, ORed into the
+//                  vector; priority-encode the reason; register the output.
 //
 //   ⚠️ THE 2-CYCLE FIGURE IS ACHIEVED BY PARALLEL EVALUATION, NOT BY CHAINING.
 //   The checks are not a sequence of tests. Every condition is computed
@@ -75,10 +76,61 @@
 //     plus a carry chain and is not expected to be critical.
 //
 //   Prefetch (off the order path, costs 0 of the 2 cycles): the parameter,
-//   venue-state and position records are read speculatively when `book_top`
-//   arrives, two cycles before the strategy can possibly emit a request for
-//   that symbol.
+//   venue-state, band-freshness and position records are read speculatively when
+//   `book_top` arrives, two cycles before the strategy can possibly emit a
+//   request for that symbol.
 //
+// -----------------------------------------------------------------------------
+// ⚠️⚠️ WHERE THE LULD BANDS COME FROM — AND WHERE THEY DO NOT
+//   The continuous LULD price bands come from the SIP (the LULD Plan's
+//   processor). THIS FPGA DOES NOT CONSUME THE SIP. They are therefore
+//   HOST-WRITTEN, per symbol, into the CRC-committed risk parameter record
+//   (`sym_risk_t.luld_lo` / `.luld_hi` / `.luld_valid`), and that record is the
+//   ONLY band source this gate reads.
+//
+//   ⚠️ THE BUG THIS REPLACES. The bands were previously taken from the feed
+//   handler's decode of ITCH message `J`. ITCH `J` is the **LULD Auction
+//   Collar**: the collar prices for a REOPENING AUCTION after a pause. It is not
+//   the continuous band, it is published only around auctions, and for a symbol
+//   that never pauses it never arrives at all. The bands therefore sat at 0/0
+//   for essentially the whole session and — because this gate is correctly
+//   fail-closed — EVERY ORDER WAS REJECTED, ALL DAY. Two different regulatory
+//   objects had been given one name, and the name is what hid it. The auction
+//   collars are still carried here, as `auc_lo`/`auc_hi` in the venue-state
+//   record, under a name that cannot be mistaken for a band.
+//
+//   ⚠️ THREE DISTINCT, SEPARATELY COUNTED OUTCOMES. "No bands loaded" and "price
+//   outside a live band" are not the same event — the first is a control-plane
+//   outage, the second is the market moving — and one counter for both is
+//   undebuggable in production. The three are made MUTUALLY EXCLUSIVE, not
+//   priority-ordered, so each counter means exactly one thing:
+//       luld_valid = 0                        -> RISK_LULD_NOT_LOADED
+//       luld_valid = 1, record older than
+//         the host-written freshness bound    -> RISK_LULD_STALE
+//       luld_valid = 1, fresh, price outside  -> RISK_LULD_BAND
+//
+//   ⚠️ BAND FRESHNESS. `luld_valid` alone is not enough: a band published at
+//   09:30 and never refreshed is worse than no band, because it looks like a
+//   control. Freshness is measured per symbol from the last SUCCESSFUL parameter
+//   commit for that symbol (the commit IS the band write), against the global
+//   host-written bound `greg[G_LULDAGE]` in core clock cycles. Bound = 0 means
+//   "never programmed" and is reported as RISK_PARAM_INVALID, not as staleness,
+//   so an unconfigured control plane is never mistaken for a stale market.
+//
+//   ⚠️ WHAT THIS OBLIGES THE HOST TO DO — this is a NEW obligation, and if it is
+//   not met the system does not trade:
+//     * subscribe to the SIP band feed off-box;
+//     * write luld_lo / luld_hi / luld_valid=1 into each enabled symbol's risk
+//       record and re-commit it whenever the band moves, and in any case more
+//       often than greg[G_LULDAGE] cycles;
+//     * clear luld_valid (and re-commit) when the band becomes unknown — after a
+//       pause, a SIP outage, a symbol-table reload, or at start of day.
+//   Band updates go through the same CRC-checked, read-backable, counted commit
+//   path as every other limit. That is deliberate: under 15c3-5(b) a band is a
+//   pre-trade control input, and inputs to pre-trade controls belong in the
+//   control plane, not on a side-channel from the market-data path.
+//
+
 // -----------------------------------------------------------------------------
 // ⚠️ PREFETCH COHERENCY RULE — how this design stays fail-closed
 //   A prefetched record is a cached copy, and a cached risk limit is a hazard.
@@ -88,8 +140,10 @@
 //         the book event that caused it;
 //       * any position/working-share/open-order update for that symbol
 //         (position_monitor.upd_notify) — so a fill can never be missed;
-//       * any parameter commit for that symbol, or any commit in progress;
-//       * any venue-state write for that symbol (halt, LULD, SSR);
+//       * any parameter commit for that symbol, or any commit in progress —
+//         which is also what makes a newly committed LULD band visible on the
+//         very next prefetch rather than up to `pf_max_age_cyc` later;
+//       * any venue-state write for that symbol (halt, auction collar, SSR);
 //       * a symbol mismatch against the request;
 //       * kill or reset — everything invalidates.
 //   Every one of these turns "I might be stale" into "reject", never into
@@ -122,11 +176,17 @@
 //
 // -----------------------------------------------------------------------------
 // RESOURCE BUDGET (estimate, pre-synthesis, VU9P-class — this module + children)
-//   LUT   ~9,500      (prefetch muxes, comparator bank, dup CAM, glue)
-//   FF    ~9,000      (4 prefetch slots ≈ 2.7k, config regs, counters, logs)
+//   LUT   ~9,900      (prefetch muxes, comparator bank, dup CAM, glue,
+//                      +~200 LUTRAM for the 256×48 band-stamp memory,
+//                      +~200 for its second read port and the age subtract)
+//   FF    ~9,300      (4 prefetch slots ≈ 2.7k, config regs, counters, logs,
+//                      +256 band-stamped bits, +32 free-cycle counter widening)
 //   BRAM  ~9          (risk_params active + shadow banks)
 //   URAM  0
 //   DSP   ~8          (4: notional 32×24; 4: Rule 612 reciprocal 32×32)
+//   ⚠️ DSP COUNT IS UNCHANGED BY THE PER-SYMBOL TICK SIZE. The reciprocal
+//   constant does not depend on tick_class — one residue serves every regime —
+//   so making the tick per-symbol cost a 7-bit lookup, not a second multiplier.
 //   Within the fpga_top budget (LUT<60k, FF<90k, BRAM<300, DSP<16), but note
 //   that this block alone is half the DSP budget. See the Rule 612 note below
 //   for the reduction available if DSP pressure appears.
@@ -144,13 +204,17 @@
 //                               RISK_ZERO_QTY, RISK_ZERO_PRICE,
 //                               RISK_BOOK_STALE, RISK_MSG_RATE.
 //   * SEC Rule 15c3-5(c)(2)   — regulatory controls applied pre-trade:
-//                               RISK_SUB_PENNY, RISK_LULD_BAND, RISK_SSR,
+//                               RISK_SUB_PENNY, RISK_LULD_BAND,
+//                               RISK_LULD_NOT_LOADED, RISK_LULD_STALE, RISK_SSR,
 //                               RISK_SYM_HALTED, RISK_SESSION_CLOSED,
 //                               RISK_RESTRICTED, RISK_SYM_DISABLED.
-//   * SEC Rule 612            — RISK_SUB_PENNY (whole-penny order prices).
+//   * SEC Rule 612            — RISK_SUB_PENNY, evaluated against the SYMBOL'S
+//                               OWN minimum pricing increment
+//                               (sym_risk_t.tick_class), not a hardcoded penny.
 //   * Reg SHO Rule 201        — RISK_SSR (short sale strictly above the NBB).
 //   * Reg SHO 203(b) / firm policy — RISK_RESTRICTED (locate / hard-to-borrow).
-//   * LULD Plan               — RISK_LULD_BAND.
+//   * LULD Plan               — RISK_LULD_BAND / _NOT_LOADED / _STALE, from
+//                               host-published SIP bands (see above).
 //   * Nasdaq halt rules       — RISK_SYM_HALTED, RISK_SESSION_CLOSED.
 //   * FINRA Rule 5210         — RISK_SELF_MATCH (wash-trade prevention,
 //                               defence in depth behind the venue's own SMP).
@@ -177,6 +241,26 @@
 //          risk_reason_e is the package contract.
 //      #6 per-symbol staleness threshold (`stale_ns`) — no field; the global
 //          `pf_max_age_cyc` plus the book's own `stale`/`crossed` flags are used.
+//          The LULD band freshness bound (`greg[G_LULDAGE]`) is likewise global
+//          rather than per-symbol: the bound is a firm policy about how stale a
+//          band may be, not a property of an instrument. If a per-symbol bound is
+//          ever required it is a `sym_risk_t` field and therefore a package
+//          change, not a local edit.
+//      #10 the LULD-derived limit/straddle states are not tracked. Only the band
+//          itself is enforced. A symbol pinned at its band is rejected on price,
+//          not on state.
+//
+// ⚠️ THE ITCH `J` AUCTION COLLAR IS CARRIED BUT NOT ENFORCED AS A GATE.
+//   `auc_lo`/`auc_hi` are stored per symbol and are readable through the
+//   read-back mux (selector 2, sub-index 1/2) for diagnostics and for proving
+//   the feed decode is alive. They are deliberately NOT turned into a price
+//   check, because every state in which an auction collar applies
+//   (TRADE_AUCTION, TRADE_PAUSED) already rejects all order entry via
+//   RISK_SYM_HALTED. A check that can never fire is worse than no check: it
+//   creates the appearance of a control and it can never be covered, which
+//   would silently defeat the "every reason must be observed to reject" gate in
+//   §12. If order entry during a reopening auction is ever enabled, THAT is when
+//   an `RISK_AUCTION_COLLAR` reason and its counter get added — together.
 //
 // =============================================================================
 `default_nettype none
@@ -216,8 +300,15 @@ module risk_gate
     input  var sym_idx_t     sym_state_idx,
     input  var trade_state_e sym_state_val,
     input  var logic         sym_ssr_val,
-    input  var price_t       sym_luld_lo,
-    input  var price_t       sym_luld_hi,
+    // ⚠️ RENAMED, DELIBERATELY AND BREAKINGLY. These are the ITCH `J` LULD
+    // AUCTION COLLAR prices from the feed handler. They are NOT the continuous
+    // LULD bands and must never again be wired to anything called `luld`. The
+    // bands are read from the risk parameter record; see the header.
+    // ⚠️ fpga_top.sv and rtl/feed/venue_state.sv still name these `sym_luld_*`
+    // and MUST be renamed to match — an elaboration error is the intended
+    // outcome until they are, because a silent rename is how this bug survived.
+    input  var price_t       sym_auc_collar_lo,
+    input  var price_t       sym_auc_collar_hi,
     input  var book_top_t    book_top,
     input  var logic         book_top_valid,
 
@@ -276,10 +367,25 @@ module risk_gate
     localparam int unsigned G_RC_SYM=24,   G_RC_POSLO=25, G_RC_POSHI=26;
     localparam int unsigned G_RC_WKB=27,   G_RC_WKS=28,   G_RC_OPEN=29, G_RC_GO=30;
     localparam int unsigned G_GROSSRST=31, G_CLRFREJ=32;
+    // ⚠️ NEW. Maximum age, in core clock cycles, of the last successful parameter
+    // commit for a symbol before that symbol's LULD bands are treated as no
+    // longer describing the live band. Reset 0 = never programmed = the design
+    // cannot trade (reported as RISK_PARAM_INVALID, see fv0 below), which is the
+    // same discipline already applied to G_DUPWIN and G_PFAGE.
+    // Range: 1 .. 2^32-1 cycles = 6.4 ns .. 27.5 s @ 156.25 MHz. The ceiling is
+    // deliberate — a band freshness bound longer than half a minute is not a
+    // freshness bound, and if one is ever wanted the honest change is to widen
+    // this register and say why, not to disable the check.
+    localparam int unsigned G_LULDAGE=33;
 
     // FLAGS bits
     localparam int unsigned F_FORCE_PO   = 0;   // reset 1
-    localparam int unsigned F_LULD_REQ   = 1;   // reset 1
+    // ⚠️ F_LULD_REQ no longer GATES the LULD checks — they are unconditional.
+    // The bit is retained at its old position, and a host that clears it is
+    // REJECTED rather than obeyed (see RISK_PARAM_INVALID below). A control that
+    // the controlled party can switch off is not a control, and an old host image
+    // must not be able to believe it disabled a Rule/Plan check and carry on.
+    localparam int unsigned F_LULD_REQ   = 1;   // reset 1, must stay 1
     localparam int unsigned F_SSR_REQ_BID= 2;   // reset 1
 
     // Saturate a 16-bit counter into a byte for the packed telemetry words.
@@ -298,12 +404,26 @@ module risk_gate
     logic [N_RISK_REASONS-1:0] t1_fv_q;
     notional_t                 t1_notional_q, t1_max_notional_q, t1_gross_base_q,
                                t1_gross_limit_q;
-    logic                      t1_whole_penny_q, t1_tick_penny_q, t1_px_ge_dollar_q;
+    // Rule 612: the 7-bit residue px mod 100 computed at T0 from the DSP
+    // reciprocal, and the symbol's minimum increment. The class-dependent lookup
+    // happens at T1 — see §7.
+    logic [6:0]                t1_resid100_q;
+    tick_class_e               t1_tick_class_q;
+    logic                      t1_px_ge_dollar_q;
     position_t                 t1_pos_base_q, t1_qty_signed_q,
                                t1_max_long_q, t1_max_short_q;
     logic                      t1_is_send_q, t1_is_cancel_q;
     logic                      accept_d, reject_d;
     risk_reason_e              verdict_d;
+
+    // Free-running core-clock counter. Two consumers: the low 16 bits stamp the
+    // reject ring log, and the full width stamps the per-symbol LULD band age.
+    // ⚠️ 48 bits is not decoration. The band age is a wrapping subtract, so the
+    // counter must not wrap within the interval being measured. 2^48 cycles at
+    // 156.25 MHz is ~20 days; 2^32 would be 27.5 s, and a band older than that
+    // would wrap and read as FRESH — a fail-OPEN. Width here is a safety
+    // property, not a resource choice.
+    cycle_t                    free_cyc_q;
 
     // =========================================================================
     // 1. Host control plane decode
@@ -363,6 +483,7 @@ module risk_gate
     notional_t   cfg_gross_limit, cfg_net_limit;
     position_t   cfg_agg_long, cfg_agg_short;
     logic [31:0] cfg_max_open_agg, cfg_dup_window, cfg_pf_max_age, cfg_param_max_age;
+    logic [31:0] cfg_luld_max_age;
     logic        flg_force_po, flg_luld_req, flg_ssr_req_bid;
 
     assign cfg_gross_limit   = {greg[G_GROSS_HI], greg[G_GROSS_LO]};
@@ -373,6 +494,7 @@ module risk_gate
     assign cfg_dup_window    = greg[G_DUPWIN];
     assign cfg_pf_max_age    = greg[G_PFAGE];
     assign cfg_param_max_age = greg[G_PARAMAGE];
+    assign cfg_luld_max_age  = greg[G_LULDAGE];
     assign flg_force_po      = greg[G_FLAGS][F_FORCE_PO];
     assign flg_luld_req      = greg[G_FLAGS][F_LULD_REQ];
     assign flg_ssr_req_bid   = greg[G_FLAGS][F_SSR_REQ_BID];
@@ -612,16 +734,22 @@ module risk_gate
     );
 
     // =========================================================================
-    // 3. Per-symbol venue state table (halt / SSR / LULD from the ITCH feed)
+    // 3. Per-symbol venue state table (halt / SSR / auction collar, from ITCH)
     //    Distributed RAM + a resettable init bitmap, so an unwritten symbol
-    //    reads as TRADE_DISABLED with SSR assumed active and no LULD bands.
-    //    Fail-closed by construction.
+    //    reads as TRADE_DISABLED with SSR assumed active. Fail-closed by
+    //    construction.
+    //    ⚠️ `auc_lo`/`auc_hi` are the ITCH `J` LULD AUCTION COLLAR prices. They
+    //    are NOT the continuous LULD bands and are NOT used as a price gate —
+    //    see the scope note in the header. They are stored so the collar decode
+    //    is observable through the read-back mux, and so that the day someone
+    //    enables order entry during a reopening auction, the data is already
+    //    here under a name that says what it is.
     // =========================================================================
     typedef struct packed {
         trade_state_e st;
         logic         ssr;
-        price_t       luld_lo;
-        price_t       luld_hi;
+        price_t       auc_lo;      // ITCH 'J' lower auction collar
+        price_t       auc_hi;      // ITCH 'J' upper auction collar
     } vstate_t;
 
     localparam int unsigned VS_W = $bits(vstate_t);
@@ -634,11 +762,11 @@ module risk_gate
 
     vstate_t vs_wr;
     always_comb begin
-        vs_wr         = '0;
-        vs_wr.st      = sym_state_val;
-        vs_wr.ssr     = sym_ssr_val;
-        vs_wr.luld_lo = sym_luld_lo;
-        vs_wr.luld_hi = sym_luld_hi;
+        vs_wr        = '0;
+        vs_wr.st     = sym_state_val;
+        vs_wr.ssr    = sym_ssr_val;
+        vs_wr.auc_lo = sym_auc_collar_lo;
+        vs_wr.auc_hi = sym_auc_collar_hi;
     end
 
     always_ff @(posedge clk) begin
@@ -650,6 +778,45 @@ module risk_gate
             for (int unsigned s = 0; s < N_ACTIVE; s++) vs_init_q[s] <= 1'b0;
         end else if (sym_state_wr) begin
             vs_init_q[sym_state_idx] <= 1'b1;
+        end
+    end
+
+    // =========================================================================
+    // 3b. LULD BAND FRESHNESS — per-symbol commit stamp
+    // =========================================================================
+    // The bands live in the CRC-committed risk record, so "when were this
+    // symbol's bands last written" is exactly "when did this symbol's record
+    // last commit successfully". One 48-bit stamp per symbol, written by the
+    // commit engine's done pulse, plus a resettable "has ever been stamped" bit.
+    //
+    // ⚠️ THE STAMPED BIT IS NOT REDUNDANT with params_valid. The stamp memory has
+    // no reset (it is LUTRAM), so out of reset it holds whatever it held before.
+    // Without the bit, a symbol could read an ancient stamp that happens to look
+    // fresh against a wrapped counter. The bit resets to 0 and only a real commit
+    // sets it: unstamped ⇒ stale ⇒ reject.
+    //
+    // ⚠️ The age is evaluated at PREFETCH time, not at T0, so it costs zero of
+    // the gate's two cycles. The slot it lands in may be up to `pf_max_age_cyc`
+    // (default 8) cycles old when used, so the enforced bound is effectively
+    // (G_LULDAGE + 8) cycles. Against a bound measured in seconds that is
+    // 51 ns of slack in the wrong direction, and it is recorded here rather than
+    // rounded away.
+    (* ram_style = "distributed" *) logic [CYCLE_CNT_W-1:0] band_stamp_mem [N_ACTIVE];
+    logic band_stamped_q [N_ACTIVE];
+
+    initial begin
+        for (int unsigned s = 0; s < N_ACTIVE; s++) band_stamp_mem[s] = '0;
+    end
+
+    always_ff @(posedge clk) begin
+        if (rp_commit_done) band_stamp_mem[rp_commit_sym] <= free_cyc_q;
+    end
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            for (int unsigned s = 0; s < N_ACTIVE; s++) band_stamped_q[s] <= 1'b0;
+        end else if (rp_commit_done) begin
+            band_stamped_q[rp_commit_sym] <= 1'b1;
         end
     end
 
@@ -675,21 +842,45 @@ module risk_gate
     assign vs_rd      = vstate_t'(vs_mem[book_top.sym]);   // async read
     assign vs_rd_init = vs_init_q[book_top.sym];
 
+    // Band-freshness reads, same stage, same index.
+    cycle_t   band_stamp_rd;
+    logic     band_stamped_rd;
+    assign band_stamp_rd   = band_stamp_mem[book_top.sym]; // async read
+    assign band_stamped_rd = band_stamped_q[book_top.sym];
+
     vstate_t  vs_q;
     logic     vs_init_r;
+    cycle_t   band_stamp_r;
+    logic     band_stamped_r;
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            bt_v_q    <= 1'b0;
-            vs_init_r <= 1'b0;
+            bt_v_q         <= 1'b0;
+            vs_init_r      <= 1'b0;
+            band_stamped_r <= 1'b0;                        // ⚠️ fail-closed
         end else begin
-            bt_v_q    <= book_top_valid;
-            vs_init_r <= book_top_valid ? vs_rd_init : 1'b0;
+            bt_v_q         <= book_top_valid;
+            vs_init_r      <= book_top_valid ? vs_rd_init     : 1'b0;
+            band_stamped_r <= book_top_valid ? band_stamped_rd : 1'b0;
         end
         if (book_top_valid) begin                          // datapath: no reset
-            bt_q <= book_top;
-            vs_q <= vs_rd;
+            bt_q         <= book_top;
+            vs_q         <= vs_rd;
+            band_stamp_r <= band_stamp_rd;
         end
+    end
+
+    // ── Band age, evaluated OFF the order path. ──────────────────────────────
+    // Unsigned wrapping subtract on a counter that cannot wrap within the
+    // measured interval (see the free_cyc_q declaration), so this is an exact
+    // elapsed-cycle count, not an approximation.
+    cycle_t band_age_d;
+    logic   bands_stale_d;
+    always_comb begin
+        band_age_d    = free_cyc_q - band_stamp_r;
+        // ⚠️ Never stamped ⇒ stale, unconditionally, whatever the arithmetic says.
+        bands_stale_d = !band_stamped_r
+                     || (band_age_d > cycle_t'({16'd0, cfg_luld_max_age}));
     end
 
     typedef struct packed {
@@ -698,6 +889,7 @@ module risk_gate
         logic [7:0]   age;
         sym_risk_t    rec;
         logic         params_valid;
+        logic         bands_stale;   // LULD band freshness, resolved at prefetch
         vstate_t      vs;
         logic         vs_init;
         price_t       bid_px;
@@ -732,6 +924,7 @@ module risk_gate
         pf_new.age          = 8'd0;
         pf_new.rec          = rp_rec;
         pf_new.params_valid = rp_pv;
+        pf_new.bands_stale  = bands_stale_d;
         pf_new.vs           = vs_q;
         pf_new.vs_init      = vs_init_r;
         pf_new.bid_px       = bt_q.bid_px;
@@ -763,6 +956,12 @@ module risk_gate
     always_comb begin
         pf_hit = '0;
         pf_sel = '0;
+        // ⚠️ Fail-closed default for the no-hit case. All-zero already means
+        // "disabled, no bands loaded, TICK_UNSET", but all-zero ALSO means
+        // bands_stale = 0, i.e. "fresh" — the one field whose safe value is 1.
+        // Spelling it out here means the miss path cannot be read as a fresh band
+        // even if the reason attribution above it is ever reordered.
+        pf_sel.bands_stale = 1'b1;
         for (int unsigned i = 0; i < PF_DEPTH; i++) begin
             pf_hit[i] = pf[i].valid
                         && (pf[i].sym == s_req.sym)
@@ -866,19 +1065,25 @@ module risk_gate
     assign is_cancel     = (s_req.action == ACT_CANCEL);
     assign is_bad_action = !(s_req.action inside {ACT_NONE, ACT_SEND, ACT_CANCEL});
 
-    // ── LULD band intersection. Two independent sources (the committed limit
-    //    record and the live ITCH side-channel); take the TIGHTER of the two.
-    //    0 means "unset" in both.
+    // ── LULD bands. ONE SOURCE: the CRC-committed, host-written risk record.
+    //    ⚠️ The old code intersected this record with the ITCH `J` side-channel
+    //    and treated 0 as "unset" in both. That conflated the continuous LULD
+    //    band with the reopening-auction collar, and because `J` almost never
+    //    arrives, the intersection was 0/0 all session and rejected everything.
+    //    The auction collar is now `pf_sel.vs.auc_*` and is not consulted here.
+    //    There is deliberately no "take the tighter of two sources" logic left:
+    //    with one authoritative source there is nothing to intersect, and the
+    //    absence of the intersection is what stops the two concepts re-merging.
     price_t luld_lo_eff, luld_hi_eff;
-    logic   luld_set;
+    logic   luld_loaded, luld_usable;
     always_comb begin
-        luld_lo_eff = (pf_sel.rec.luld_lo > pf_sel.vs.luld_lo) ? pf_sel.rec.luld_lo
-                                                               : pf_sel.vs.luld_lo;
-        if (pf_sel.rec.luld_hi == price_t'(0))      luld_hi_eff = pf_sel.vs.luld_hi;
-        else if (pf_sel.vs.luld_hi == price_t'(0))  luld_hi_eff = pf_sel.rec.luld_hi;
-        else luld_hi_eff = (pf_sel.rec.luld_hi < pf_sel.vs.luld_hi) ? pf_sel.rec.luld_hi
-                                                                    : pf_sel.vs.luld_hi;
-        luld_set = (luld_hi_eff != price_t'(0));
+        luld_lo_eff = pf_sel.rec.luld_lo;
+        luld_hi_eff = pf_sel.rec.luld_hi;
+        // "Loaded" is the host's explicit assertion, NOT an inference from the
+        // values. A band of 0/0 with luld_valid=1 is caught by the sanity gate in
+        // risk_params and can never reach here.
+        luld_loaded = pf_sel.rec.luld_valid;
+        luld_usable = luld_loaded && !pf_sel.bands_stale;
     end
 
     // ── SSR. Live feed flag OR'd with the committed record: if EITHER says the
@@ -965,18 +1170,30 @@ module risk_gate
     notional_t notional_d;
     assign notional_d = notional_t'(64'(s_req.price) * 64'(mul_qty));
 
-    // ⚠️ SEC RULE 612 — sub-penny. `trading_pkg::is_whole_penny` is a
-    // reciprocal-multiply (px * 1_374_389_535 >> 37), NOT a divider and NOT a
-    // modulo (CLAUDE.md §5 rule 3, 00-foundations/03-*.md §7). It costs the
-    // second DSP cluster in T0.
-    // Note for future DSP pressure: 100 = 4 × 25, so `px[1:0] != 0` is a free
-    // necessary condition that catches 75 % of violations, and the reciprocal
-    // then only needs to run on px>>2 against 25 (a narrower multiply). That
-    // optimisation is NOT applied here because trading_pkg::is_whole_penny is
-    // the package contract and a divergent local copy of a Rule 612 test is
-    // exactly the kind of drift this project cannot afford.
-    logic whole_penny_d, px_ge_dollar_d;
-    assign whole_penny_d  = is_whole_penny(s_req.price);
+    // ⚠️ SEC RULE 612 — PER-SYMBOL minimum pricing increment.
+    // `trading_pkg::resid100` is a reciprocal-multiply (px * 1_374_389_535 >> 37)
+    // followed by a shift-add subtract, NOT a divider and NOT a modulo
+    // (CLAUDE.md §5 rule 3, 00-foundations/03-*.md §7). It costs the second DSP
+    // cluster in T0. The exactness proof over the full ITCH price span
+    // ($0.0000 .. $429,496.7295) is in trading_pkg.sv §6 and is the reason this
+    // is allowed to be a multiply at all.
+    //
+    // ⚠️ THE TICK SIZE IS NO LONGER A CONSTANT. It was `is_whole_penny`, which
+    // baked the whole-cent regime into the package. The SEC's 2024 Rule 612
+    // amendments introduce a half-penny increment for certain symbols,
+    // reassigned periodically — under which that test rejects valid orders.
+    // The increment now comes from `sym_risk_t.tick_class`, and the ONLY thing
+    // that varies with it is a 7-bit set-membership lookup at T1.
+    //
+    // ⚠️ WHY THE SPLIT IS FREE. The DSP constant is 1/100 for every tick class,
+    // because every supported increment divides 100 (see tick_class_e). So the
+    // multiply operand path carries no mux, T0 is unchanged from the whole-penny
+    // version (multiply → shift-add → subtract, in place of
+    // multiply → shift-add → compare), and the class-dependent part is one LUT
+    // in T1, which the header records as the non-critical stage.
+    logic [6:0] resid100_d;
+    logic       px_ge_dollar_d;
+    assign resid100_d     = resid100(s_req.price);
     assign px_ge_dollar_d = (s_req.price >= ONE_DOLLAR);
 
     // ── Projected position base: current position + working shares on the side
@@ -1020,12 +1237,22 @@ module risk_gate
         fv0[RISK_PRICE_COLLAR]    = is_send && ((s_req.price < pf_sel.rec.collar_lo)
                                              || (s_req.price > pf_sel.rec.collar_hi));
 
-        // 9 LULD band
-        fv0[RISK_LULD_BAND]       = is_send && (flg_luld_req
-                                      ? (!luld_set || (s_req.price < luld_lo_eff)
-                                                   || (s_req.price > luld_hi_eff))
-                                      : (luld_set && ((s_req.price < luld_lo_eff)
-                                                   || (s_req.price > luld_hi_eff))));
+        // 9 / 24 / 25 LULD, as THREE MUTUALLY EXCLUSIVE outcomes.
+        // ⚠️ Mutual exclusion is deliberate and is not an optimisation. Reason
+        // attribution reports the LOWEST set index, and RISK_LULD_BAND (9) is
+        // numerically below the two appended reasons (24, 25). If all three could
+        // be set at once, a symbol whose bands had NEVER been loaded would be
+        // reported as "price outside the band" — the exact misattribution that
+        // made the original defect invisible. Each of the three conditions below
+        // therefore excludes the others by construction, and each has its own
+        // saturating counter in `reject_cnt`.
+        // ⚠️ The checks are unconditional. There is no flag that disables them;
+        // see F_LULD_REQ, which is now a fail-closed assertion rather than a gate.
+        fv0[RISK_LULD_NOT_LOADED] = is_send && !luld_loaded;
+        fv0[RISK_LULD_STALE]      = is_send &&  luld_loaded && pf_sel.bands_stale;
+        fv0[RISK_LULD_BAND]       = is_send &&  luld_usable
+                                             && ((s_req.price < luld_lo_eff)
+                                              || (s_req.price > luld_hi_eff));
 
         // 10 Reg SHO Rule 201
         fv0[RISK_SSR]             = ssr_fail;
@@ -1072,8 +1299,20 @@ module risk_gate
                                  ||  pm_upd_ovf              // a position update was lost
                                  || !tk_ready                // no token available
                                  ||  is_bad_action           // illegal action encoding
-                                 || (cfg_dup_window == 32'd0)
-                                 || (cfg_pf_max_age == 32'd0);
+                                 || (cfg_dup_window   == 32'd0)
+                                 || (cfg_pf_max_age   == 32'd0)
+                                 // ⚠️ Band freshness bound never programmed. This
+                                 // is a CONFIGURATION fault, not a stale market,
+                                 // and reporting it as RISK_LULD_STALE would send
+                                 // an operator hunting the SIP feed for a bug that
+                                 // is in their own arming script.
+                                 || (cfg_luld_max_age == 32'd0)
+                                 // ⚠️ The host tried to disable the LULD checks.
+                                 // Refused, loudly: a pre-trade control the
+                                 // controlled party can switch off is not a
+                                 // control. Clearing this bit stops trading; it
+                                 // does not weaken the check.
+                                 || !flg_luld_req;
 
         // ⚠️ CANCELS ARE RISK-REDUCING. A cancel carries no price, size or
         // position exposure, and blocking cancels is how a bad situation becomes
@@ -1109,8 +1348,8 @@ module risk_gate
         t1_max_notional_q <= pf_sel.rec.max_order_notional;
         t1_gross_base_q   <= pm_gross;
         t1_gross_limit_q  <= cfg_gross_limit;
-        t1_whole_penny_q  <= whole_penny_d;
-        t1_tick_penny_q   <= pf_sel.rec.tick_penny;
+        t1_resid100_q     <= resid100_d;
+        t1_tick_class_q   <= pf_sel.rec.tick_class;
         t1_px_ge_dollar_q <= px_ge_dollar_d;
         t1_pos_base_q     <= pos_base_d;
         t1_qty_signed_q   <= qty_signed_d;
@@ -1139,6 +1378,22 @@ module risk_gate
 
     assign gross_new = sat_add64(t1_gross_base_q, t1_notional_q);
 
+    // ── SEC Rule 612, second half: is the T0 residue on this symbol's grid?
+    //    Below $1.00 the minimum increment is $0.0001 = 1 ITCH unit, which every
+    //    representable price already meets — but the symbol must still have a
+    //    real tick class, or it is unprovisioned and untradeable at any price.
+    //    ⚠️ This is `trading_pkg::tick_resid_ok`, the same function the reference
+    //    `tick_price_ok` calls. There is no local copy of the rule here.
+    logic tick_ok;
+    always_comb begin
+        tick_ok = 1'b0;                             // default: fail-closed, no latches
+        if (t1_px_ge_dollar_q)
+            tick_ok = tick_resid_ok(t1_resid100_q, t1_tick_class_q);
+        else
+            tick_ok = (t1_tick_class_q != TICK_UNSET)
+                   && (t1_tick_class_q != TICK_RSVD);
+    end
+
     always_comb begin
         fv1 = t1_fv_q;                              // default: carry T0 forward
 
@@ -1147,9 +1402,8 @@ module risk_gate
         fv1[RISK_KILL_SWITCH] = fv1[RISK_KILL_SWITCH] || kill_active;
 
         if (t1_is_send_q) begin
-            // 7 SEC Rule 612 — whole-penny prices for stocks >= $1.00.
-            fv1[RISK_SUB_PENNY]    = t1_tick_penny_q && t1_px_ge_dollar_q
-                                     && !t1_whole_penny_q;
+            // 7 SEC Rule 612 — price on the SYMBOL'S minimum-increment grid.
+            fv1[RISK_SUB_PENNY]    = !tick_ok;
             // 14 max order notional (the DSP product from T0)
             fv1[RISK_MAX_NOTIONAL] = (t1_notional_q > t1_max_notional_q);
             // 15/16 projected position within [-max_short, +max_long].
@@ -1336,7 +1590,8 @@ module risk_gate
     localparam int unsigned RL_PAD_W = 128;          // read back as 4×32-bit words
     (* ram_style = "distributed" *) logic [RL_W-1:0] rej_log [REJ_LOG_DEPTH];
     logic [LOG_PTR_W-1:0] rej_log_wr_q;
-    logic [15:0]          free_cyc_q;
+    // `free_cyc_q` is declared with the forward references at the top of the
+    // module: it is 48 bits wide and is also the LULD band-age time base.
 
     rej_log_t rej_log_d;
     always_comb begin
@@ -1347,15 +1602,19 @@ module risk_gate
         rej_log_d.is_short = t1_req_q.is_short;
         rej_log_d.price    = t1_req_q.price;
         rej_log_d.qty      = t1_req_q.qty;
-        rej_log_d.cycle_lo = free_cyc_q;
+        rej_log_d.cycle_lo = free_cyc_q[15:0];
     end
 
     always_ff @(posedge clk) begin
         if (rst) begin
             rej_log_wr_q <= '0;
-            free_cyc_q   <= 16'd0;
+            free_cyc_q   <= '0;
         end else begin
-            free_cyc_q <= free_cyc_q + 16'd1;
+            // ⚠️ Free-running and NEVER saturating: this is a time base, not a
+            // counter of events. Saturating it would freeze every band age at
+            // "fresh" after 20 days of uptime — a fail-open. It wraps, and the
+            // subtract that consumes it is exact across the wrap.
+            free_cyc_q <= free_cyc_q + cycle_t'(1);
             if (reject_d) begin
                 rej_log[rej_log_wr_q] <= RL_W'(rej_log_d);
                 rej_log_wr_q          <= rej_log_wr_q + LOG_PTR_W'(1);
@@ -1394,24 +1653,51 @@ module risk_gate
     logic [11:0]          rb_idx;
     logic [31:0]          rb_mux_q;
     logic [ACT_IDX_W-1:0] rb_sidx;
+    logic [3:0]           rb_ssub;
     logic [LOG_PTR_W-1:0] rb_lidx;
     logic [1:0]           rb_lwrd;
     logic [RL_PAD_W-1:0]  rb_log_pad;
+    vstate_t              rb_vs;
+    cycle_t               rb_stamp;
 
     assign rb_sel     = greg[G_RBADDR][14:12];
     assign rb_idx     = greg[G_RBADDR][11:0];
     assign rb_sidx    = rb_idx[ACT_IDX_W-1:0];
+    // ⚠️ Sub-selector for the per-symbol window. rb_idx[11:8] was previously
+    // ignored (ACT_IDX_W = 8), so sub-index 0 is exactly the old behaviour and
+    // existing host readers are unaffected. Additive, never renumbering.
+    assign rb_ssub    = rb_idx[11:8];
     assign rb_lidx    = rb_idx[LOG_PTR_W-1:0];
     assign rb_lwrd    = rb_idx[LOG_PTR_W+1 -: 2];
     assign rb_log_pad = {{(RL_PAD_W-RL_W){1'b0}}, rej_log[rb_lidx]};
+    assign rb_vs      = vstate_t'(vs_mem[rb_sidx]);
+    assign rb_stamp   = band_stamp_mem[rb_sidx];
 
     always_ff @(posedge clk) begin
         rb_mux_q <= 32'd0;                          // default assignment
         unique case (rb_sel)
             // 0/1: per-symbol limit record, active and shadow banks.
             3'd0, 3'd1 : rb_mux_q <= rp_rb_data;
-            // 2: per-symbol first-reject latch  {valid, reason}
-            3'd2       : rb_mux_q <= {26'd0, frej_vld_q[rb_sidx], frej_mem[rb_sidx]};
+            // 2: per-symbol diagnostics window. idx[7:0] = symbol,
+            //    idx[11:8] = sub-index (0 = the original first-reject latch).
+            //    ⚠️ Sub-indices 1..5 exist so the ITCH `J` auction collar and the
+            //    LULD band-freshness stamp are OBSERVABLE. The defect this
+            //    replaces was invisible for exactly one reason: nothing in the
+            //    machine could be asked "what bands do you think you have, and
+            //    when did you last get them?".
+            3'd2       : begin
+                unique case (rb_ssub)
+                    4'd0 : rb_mux_q <= {26'd0, frej_vld_q[rb_sidx], frej_mem[rb_sidx]};
+                    4'd1 : rb_mux_q <= rb_vs.auc_lo;       // ITCH 'J' collar, NOT a band
+                    4'd2 : rb_mux_q <= rb_vs.auc_hi;       // ITCH 'J' collar, NOT a band
+                    4'd3 : rb_mux_q <= {27'd0, vs_init_q[rb_sidx], rb_vs.ssr,
+                                               rb_vs.st};
+                    4'd4 : rb_mux_q <= rb_stamp[31:0];     // last commit stamp, lo
+                    4'd5 : rb_mux_q <= {15'd0, band_stamped_q[rb_sidx],
+                                        rb_stamp[CYCLE_CNT_W-1:32]};
+                    default: rb_mux_q <= 32'd0;
+                endcase
+            end
             // 3: reject ring log. idx[3:0] = entry, idx[5:4] = 32-bit word.
             3'd3       : rb_mux_q <= rb_log_pad[{rb_lwrd, 5'd0} +: 32];
             // 4: per-reason rejection counters (same data as the reject_cnt port,
@@ -1502,6 +1788,63 @@ module risk_gate
             $error("risk_gate: failure vector width != N_RISK_REASONS");
     end
 
+    // ⚠️ PROOF-BY-SWEEP OF THE RULE 612 ARITHMETIC, run at elaboration.
+    //   The algebraic proof that (px * 1_374_389_535) >> 37 == floor(px/100) for
+    //   every px in [0, 2^32-1] is written out in trading_pkg.sv §6. THIS block
+    //   checks that the proof was transcribed into RTL correctly, which is a
+    //   different question and the one that actually goes wrong.
+    //   `/` and `%` appear here and NOWHERE else in the design: this block is
+    //   inside `ifndef SYNTHESIS` and is never synthesized. Using a real divider
+    //   as the oracle is the whole point — the fabric must match it exactly.
+    //   Coverage: every price 0..$2.0000 (both sides of the $1.00 boundary and
+    //   every residue), a stride across the full 32-bit span, and the top of the
+    //   ITCH range where a reciprocal that is off by one fails first.
+    initial begin : b_tick_sweep
+        int unsigned errs;
+        int unsigned units;
+        logic        want, got;
+        price_t      px;
+        errs = 0;
+
+        for (int unsigned k = 0; k < 250_000; k++) begin
+            // 0..20000 exhaustive, then a coprime stride to the top of the range,
+            // then the last 200 codes below 2^32.
+            if      (k <= 20_000)  px = price_t'(k);
+            else if (k <  249_800) px = price_t'((k * 32'd17_389) & 32'hFFFF_FFFF);
+            else                   px = price_t'(32'hFFFF_FFFF - (249_999 - k));
+
+            if (resid100(px) != 7'(px % 32'd100)) begin
+                errs++;
+                if (errs < 5)
+                    $error("resid100(%0d) = %0d, expected %0d",
+                           px, resid100(px), px % 32'd100);
+            end
+            if (div100(px) != (px / 32'd100)) begin
+                errs++;
+                if (errs < 5)
+                    $error("div100(%0d) = %0d, expected %0d",
+                           px, div100(px), px / 32'd100);
+            end
+
+            for (int unsigned c = 0; c < 8; c++) begin
+                units = int'(tick_units(tick_class_e'(c[2:0])));
+                if (units == 0)                     want = 1'b0;  // UNSET / RSVD
+                else if (px < RULE612_DOLLAR_PX)    want = 1'b1;  // $0.0001 grid
+                else                                want = ((px % price_t'(units)) == 32'd0);
+                got = tick_price_ok(px, tick_class_e'(c[2:0]));
+                if (got !== want) begin
+                    errs++;
+                    if (errs < 5)
+                        $error("tick_price_ok(%0d, class %0d) = %0b, expected %0b",
+                               px, c, got, want);
+                end
+            end
+        end
+
+        if (errs != 0)
+            $fatal(1, "SEC RULE 612: tick arithmetic is not exact (%0d mismatches)", errs);
+    end
+
     // ⚠️⚠️ THE CENTRAL INVARIANT. An order is emitted only if EVERY check
     // passed. If this ever fails, the design has market access it is not
     // entitled to.
@@ -1564,11 +1907,63 @@ module risk_gate
         m_out_valid |-> $past(credit_q, 2)
     ) else $error("order emitted with no in-flight credit");
 
-    a_subpenny : assert property (@(posedge clk) disable iff (rst)
-        (m_out_valid && (m_out.action == ACT_SEND)
-         && $past(t1_tick_penny_q) && $past(t1_px_ge_dollar_q))
-        |-> $past(t1_whole_penny_q)
-    ) else $fatal(1, "SEC RULE 612 VIOLATION: sub-penny order price emitted");
+    // ── SEC Rule 612, per-symbol tick size ───────────────────────────────────
+    // ⚠️ No emitted order is ever off its symbol's minimum-increment grid. This
+    // covers every tick class including TICK_UNSET and TICK_RSVD, both of which
+    // make `tick_ok` false, so an unprovisioned symbol cannot emit at any price.
+    a_tick_grid : assert property (@(posedge clk) disable iff (rst)
+        (m_out_valid && (m_out.action == ACT_SEND)) |-> $past(tick_ok)
+    ) else $fatal(1, "SEC RULE 612 VIOLATION: order priced off the symbol's tick grid");
+
+    // ⚠️ THE SPLIT IMPLEMENTATION EQUALS THE REFERENCE, EXACTLY, EVERY TIME.
+    // The gate computes the residue at T0 and the class lookup at T1 for timing;
+    // `trading_pkg::tick_price_ok` computes both in one call. If those two ever
+    // disagree — a pipelining bug, a stale registered class, a boundary price —
+    // this fires. It is the assertion that makes the T0/T1 split safe to do at
+    // all, and it is checked at EVERY price the strategy actually presents,
+    // including the $1.00 boundary and the top of the ITCH range.
+    a_tick_reference : assert property (@(posedge clk) disable iff (rst)
+        (t1_valid_q && t1_is_send_q)
+        |-> (tick_ok == tick_price_ok(t1_req_q.price, t1_tick_class_q))
+    ) else $fatal(1, "Rule 612 pipeline split diverged from trading_pkg::tick_price_ok at price %0d class %0d",
+                  t1_req_q.price, t1_tick_class_q);
+
+    // ── LULD, all three outcomes ─────────────────────────────────────────────
+    // ⚠️ A symbol whose bands were never loaded NEVER passes. This is the
+    // property the original defect inverted: bands sourced from ITCH `J` were
+    // absent, so this held — by rejecting everything. It must now hold while the
+    // system is actually trading.
+    a_luld_loaded : assert property (@(posedge clk) disable iff (rst)
+        (accept_d && t1_is_send_q) |-> $past(luld_loaded)
+    ) else $fatal(1, "LULD PLAN VIOLATION: order accepted for a symbol with no bands loaded");
+
+    a_luld_fresh : assert property (@(posedge clk) disable iff (rst)
+        (accept_d && t1_is_send_q) |-> !$past(pf_sel.bands_stale)
+    ) else $fatal(1, "LULD PLAN VIOLATION: order accepted against stale bands");
+
+    // ⚠️ An order priced outside the live band never passes. Stated against the
+    // BANDS THEMSELVES rather than against the failure vector, so a bug in how
+    // fv0[RISK_LULD_BAND] is built cannot hide behind its own construction.
+    a_luld_inside : assert property (@(posedge clk) disable iff (rst)
+        (accept_d && t1_is_send_q)
+        |-> ((t1_req_q.price >= $past(luld_lo_eff))
+          && (t1_req_q.price <= $past(luld_hi_eff)))
+    ) else $fatal(1, "LULD PLAN VIOLATION: order priced outside the live band emitted");
+
+    // ⚠️ The three LULD reasons are mutually exclusive, so each counter means
+    // exactly one thing. If this fails, the counters are no longer attributable
+    // even though the gate is still safe — which is the failure mode that makes
+    // a control undebuggable rather than unsafe.
+    a_luld_exclusive : assert property (@(posedge clk) disable iff (rst)
+        $onehot0({fv0[RISK_LULD_BAND], fv0[RISK_LULD_NOT_LOADED],
+                  fv0[RISK_LULD_STALE]})
+    ) else $error("LULD reject reasons are not mutually exclusive — counters are not attributable");
+
+    // ⚠️ The LULD checks cannot be switched off by the host. Clearing F_LULD_REQ
+    // stops trading; it must never let an order through.
+    a_luld_not_disableable : assert property (@(posedge clk) disable iff (rst)
+        m_out_valid |-> $past(flg_luld_req, 2)
+    ) else $fatal(1, "order emitted with the LULD checks disabled");
 
     a_qty_ceiling : assert property (@(posedge clk) disable iff (rst)
         (m_out_valid && (m_out.action == ACT_SEND)) |-> (m_out.qty <= HARD_MAX_QTY)
@@ -1650,6 +2045,43 @@ module risk_gate
                                        t1_valid_q && !pf_valid_hit);
     c_dup_expire    : cover property (@(posedge clk) disable iff (rst)
                                        dup[0].valid && (dup[0].age == cfg_dup_window));
+
+    // ⚠️ The half-penny regime must be EXERCISED, not merely supported. A tick
+    // class that has never been traded against is a compliance claim nobody has
+    // tested. CI must see all three of these.
+    c_tick_penny    : cover property (@(posedge clk) disable iff (rst)
+                                       accept_d && t1_is_send_q
+                                       && (t1_tick_class_q == TICK_0100));
+    c_tick_half     : cover property (@(posedge clk) disable iff (rst)
+                                       accept_d && t1_is_send_q
+                                       && (t1_tick_class_q == TICK_0050));
+    c_tick_half_rej : cover property (@(posedge clk) disable iff (rst)
+                                       reject_d && (verdict_d == RISK_SUB_PENNY)
+                                       && (t1_tick_class_q == TICK_0050));
+    // Boundary prices: exactly $1.00 (coarse grid applies, and 10000 is on every
+    // supported grid) and one unit below (fine grid, always legal).
+    c_tick_at_dollar : cover property (@(posedge clk) disable iff (rst)
+                                       accept_d && t1_is_send_q
+                                       && (t1_req_q.price == RULE612_DOLLAR_PX));
+    c_tick_sub_dollar: cover property (@(posedge clk) disable iff (rst)
+                                       accept_d && t1_is_send_q
+                                       && (t1_req_q.price == (RULE612_DOLLAR_PX - 32'd1)));
+
+    // ⚠️ Each LULD outcome observed independently. "Bands loaded and wide" must
+    // be seen to ACCEPT — otherwise the fix for the original defect has not been
+    // demonstrated, only asserted.
+    c_luld_accept   : cover property (@(posedge clk) disable iff (rst)
+                                       accept_d && t1_is_send_q);
+    c_luld_edge_lo  : cover property (@(posedge clk) disable iff (rst)
+                                       accept_d && t1_is_send_q
+                                       && (t1_req_q.price == $past(luld_lo_eff)));
+    c_luld_edge_hi  : cover property (@(posedge clk) disable iff (rst)
+                                       accept_d && t1_is_send_q
+                                       && (t1_req_q.price == $past(luld_hi_eff)));
+    c_luld_stale    : cover property (@(posedge clk) disable iff (rst)
+                                       reject_d && (verdict_d == RISK_LULD_STALE));
+    c_luld_unloaded : cover property (@(posedge clk) disable iff (rst)
+                                       reject_d && (verdict_d == RISK_LULD_NOT_LOADED));
 `endif
 
 endmodule : risk_gate
