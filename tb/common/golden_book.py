@@ -55,7 +55,7 @@ disappears."
 The shared simplifications live in :class:`BookConfig`, whose defaults mirror
 ``rtl/pkg/trading_pkg.sv``:
 
-  ``BOOK_LEVELS   = 16``  price levels tracked per side
+  ``BOOK_LEVELS   = 2048``  price levels tracked per side
   ``N_ACTIVE      = 256`` symbols in the filtered active set
   ``PRICE_SCALE   = 10000`` 4 implied decimals — integers only, never floats
 
@@ -98,7 +98,7 @@ SELL = "S"
 class BookConfig:
     """The simplifications the hardware makes, mirrored exactly."""
 
-    book_levels: int = 16          # trading_pkg::BOOK_LEVELS
+    book_levels: int = 2048        # trading_pkg::BOOK_LEVELS
     n_active: int = 256            # trading_pkg::N_ACTIVE
     price_scale: int = 10_000      # trading_pkg::PRICE_SCALE
     #: Locates the design tracks. ``None`` = all of them (unit tests);

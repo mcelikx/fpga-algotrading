@@ -179,8 +179,15 @@ _STAGE_MATCH: dict[str, str] = {
     "itch_assemble": "itch message assembly",
     "itch_decode": "itch decode",
     "symbol_filter": "symbol filter",
-    "order_id_map": "order-id map lookup",
-    "book_update": "book level update",
+    # The order book was rewritten (docs/ORDER-BOOK-REDESIGN.md) and its two
+    # budget rows became five as the pipeline went 4 -> 7 cycles. The stage_ids
+    # `order_id_map` and `book_update` are KEPT so existing tests that reference
+    # them still resolve; only the row text they match moved.
+    "book_b0":     "book b0",                  # input reg + early window check
+    "order_id_map": "book b1-b2",              # cuckoo map, 2 parallel buckets
+    "book_update": "book b3-b4",               # price-level classify + RMW
+    "book_tob":    "book b5",                  # incremental top-of-book
+    "book_out":    "book b6",                  # output registration
     "strategy": "strategy parameter read",
     "risk_gate": "pre-trade risk gate",
     "ouch_encode": "ouch template read",
@@ -504,8 +511,8 @@ SYM_IDX_W = 13
 N_ACTIVE = 256
 ACT_IDX_W = 8
 
-BOOK_LEVELS = 16
-LEVEL_IDX_W = 4
+BOOK_LEVELS = 2048
+LEVEL_IDX_W = 11
 ORDER_MAP_ENTRIES = 1 << 16
 ORDER_MAP_WAYS = 4
 

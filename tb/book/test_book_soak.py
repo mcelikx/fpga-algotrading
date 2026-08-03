@@ -30,7 +30,7 @@ WHY IT MATTERS
 
 THE FIVE RULES (05-verification §4), and how this file implements them
     1. The oracle implements exactly the same simplifications as the RTL —
-       BOOK_LEVELS=16, N_ACTIVE=256, the same active-locate filter — via the
+       BOOK_LEVELS=2048, N_ACTIVE=256, the same active-locate filter — via the
        shared ``BookConfig``.  Divergence caused by an intentional simplification
        is indistinguishable from a bug.
     2. Canonical, integer-only, one-record-per-line serialization
