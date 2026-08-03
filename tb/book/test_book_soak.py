@@ -96,6 +96,7 @@ from tb_util import (  # noqa: E402
     rtl_exists,
     seed_note,
     seeded_rng,
+    REPO_ROOT,
     sim_sources,
 )
 import itch_gen as ig  # noqa: E402
@@ -537,6 +538,48 @@ try:
         dut.rst.value = 0
         await RisingEdge(dut.clk)
 
+        # ── Host anchor: REQUIRED SETUP, not a convenience ────────────────────
+        # price_levels is host-anchored and fails closed: "A symbol is DEAD
+        # (every update rejected, stale asserted, re-anchor requested) until the
+        # host writes its reference price through cfg_*" (price_levels.sv §"THE
+        # WINDOW IS HOST-ANCHORED").  Without this loop the very first Add Order
+        # is rejected and no top-of-book is ever produced -- which is the DUT
+        # behaving exactly as specified, not a book defect.
+        #
+        # This test predates the host-anchored window; its own docstring says
+        # rtl/book/ did not exist when it was written.
+        #
+        # ⚠️ The anchor is written at the price the generator centres on. If
+        #    BASE_PX and this value ever drift apart, every symbol silently
+        #    reports out-of-window instead of failing loudly -- check
+        #    stat7 (cnt_oow_*) and stat10 (cnt_reanchor) before believing a
+        #    clean run.
+        dut.cfg_ref_valid.value = 0
+        await RisingEdge(dut.clk)
+        for _sym in range(N_LOCATES + 1):
+            # Wait for READY FIRST, then pulse valid for exactly one cycle.
+            # Asserting valid while a write is in flight makes book_engine drop
+            # it -- and it asserts loudly rather than dropping quietly, which is
+            # how this loop's first version was caught (book_engine.sv:1054).
+            _guard = 0
+            while True:
+                await ReadOnly()
+                if int(dut.cfg_ref_ready.value):
+                    break
+                await RisingEdge(dut.clk)
+                _guard += 1
+                assert _guard <= 64, (
+                    f"cfg_ref_ready never asserted for sym={_sym} — the host "
+                    f"anchor port is not accepting writes." + seed_note(seed)
+                )
+            await RisingEdge(dut.clk)
+            dut.cfg_ref_sym.value = _sym
+            dut.cfg_ref_px.value = BASE_PX
+            dut.cfg_ref_valid.value = 1
+            await RisingEdge(dut.clk)
+            dut.cfg_ref_valid.value = 0
+        await ClockCycles(dut.clk, 8)
+
         oracle = GoldenBook(BookConfig(active_locates=set(LOCATES)))
         gen = BookStimGenerator(rng, adversarial=True)
         board = Scoreboard("book_soak", history=8, seed=seed)
@@ -716,7 +759,19 @@ if __name__ == "__main__":  # pragma: no cover
             "rtl/book/book_engine.sv", "tb/book/tb_book_engine_top.sv",
         ),
         hdl_toplevel="tb_book_engine_top",
-        build_args=["-Wno-fatal"],
+        # --timing: the RTL uses timing controls (SVA, clocking); without it
+        #   Verilator refuses with NEEDTIMINGOPT.
+        # --assert: the point of this test is that the DUT's own assertions fire
+        #   on a divergence, not just that the Python comparison notices.
+        # -y rtl/common: top_of_book instantiates prio_encoder, which is not in
+        #   the source list above. Resolve it by name rather than by growing the
+        #   list, so a new submodule does not silently break the build.
+        build_args=[
+            "-Wno-fatal", "--timing", "--assert",
+            "-y", str(REPO_ROOT / "rtl" / "common"),
+            "-y", str(REPO_ROOT / "rtl" / "pkg"),
+            "+libext+.sv",
+        ],
         always=True,
     )
     runner.test(hdl_toplevel="tb_book_engine_top", test_module="test_book_soak")

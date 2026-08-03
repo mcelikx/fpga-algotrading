@@ -176,5 +176,54 @@ anything:
   half its tests do not apply to whichever one is built.
 
 **Nothing here has been synthesized, placed, routed, or run on hardware.**
-`tb/book/test_book_soak.py` — the golden-model equivalence check that decides
-whether the order book is actually correct — has still never been executed.
+
+---
+
+## Order book — golden-model equivalence, first execution
+
+`tb/book/test_book_soak.py` now runs. Getting there needed three pieces of
+infrastructure that were written but never executed:
+
+| Gap | Fix |
+| --- | --- |
+| `tb/book/tb_book_engine_top.sv` did not exist | Written — flattens the packed-struct ports for the VPI |
+| Runner omitted `--timing`, `--assert`, and `prio_encoder` | Added `-y rtl/common` |
+| Test never wrote the host reference price | Anchor setup added |
+
+**Status: 39 messages verified against the golden model, then a stop at
+`seq=40` (`depth_overflow`).**
+
+### What the two failures taught, in order
+
+1. **First message produced no top-of-book at all.** Not a book defect —
+   `price_levels` is host-anchored and fails closed: *"A symbol is DEAD until
+   the host writes its reference price"*. The test predates that design change
+   (its docstring still says `rtl/book/` does not exist). Establishing this took
+   two greps, not a theory.
+2. **The anchor loop I wrote was wrong, and the DUT said so:**
+   `book_engine.sv:1054 — host reference-price write arrived while one was in
+   flight — it was DROPPED`. I asserted `valid` before checking `ready`. ⚠️ The
+   assertion fired on the first offending cycle. Had the RTL dropped the write
+   quietly, the symptom would have been a mis-anchored window thousands of
+   messages later, presenting as a book divergence.
+
+### ⚠️ Open design question — not a bug, a contract decision
+
+At `seq=40` an order is priced outside the 2048-level window. `price_levels`
+rejects it (`res_in_window = 0`) and no top-of-book is published, so the test
+waits for an output that will never come.
+
+The behaviour matches the manual. The question is whether it *should*:
+
+- **As specified:** a rejected update publishes nothing. A downstream consumer
+  cannot distinguish "no update this message" from "an update was discarded and
+  your book may now be wrong."
+- **The alternative:** publish the unchanged top of book with `stale` set, so
+  the rejection is observable in the datapath rather than only in `stat7`.
+
+The project's fail-loud principle (CLAUDE.md §5.7, *"every drop, error and
+rejection is counted"*) points at the second. But this changes `book_engine`'s
+output contract and belongs to the RTL owner, not to whoever is running tests.
+
+Until it is settled, the soak test cannot get past the first out-of-window
+message, and **the order book remains unverified beyond 39 messages.**
