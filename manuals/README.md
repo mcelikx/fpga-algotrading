@@ -135,6 +135,23 @@ specification disagree, **the specification wins** and this tier gets corrected.
 | 08 | [Connectivity and Colocation](08-nasdaq/08-connectivity-and-colocation.md) | Carteret, cross-connects, ports, MPIDs, onboarding, conformance |
 | 09 | [Risk Controls and Limits](08-nasdaq/09-risk-controls-and-limits.md) | The implementable pre-trade risk specification and the kill switch |
 
+## 09–12 — Depth tiers
+
+Written after the core tiers. A deep dive assumes you have read the tier that
+introduces the topic and goes further than a working manual can.
+
+| Tier | Covers | Status |
+| --- | --- | --- |
+| [09 — Deep Dives](09-deep-dives/) | Queue position economics, adverse selection, cancel latency, fixed-point arithmetic, hash structures, timing forensics, jitter, open/close dynamics, failure modes, partial reconfiguration | 10 files |
+| [10 — Quant Methods](10-quant-methods/) | Signal construction, fair value, statistics, backtesting, parameter calibration | ⚠️ partial |
+| [11 — Platform](11-platform/) | Card selection, vendor ecosystem, bring-up, thermals, lab equipment | ⚠️ partial |
+| [12 — Security and Resilience](12-security-and-resilience/) | Threat model, supply chain and bitstream integrity, access control, failure isolation, incident preparedness | 6 files |
+
+⚠️ Tiers 10 and 11 are **incomplete** — their fleets were interrupted partway.
+The files present are finished; the missing ones are listed in each tier's index
+and show up as broken links in `scripts/validate.py`. That is deliberate: the
+gap is visible rather than quietly papered over.
+
 ---
 
 ## Conventions used in these manuals
