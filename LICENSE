@@ -1,0 +1,44 @@
+MIT License
+
+Copyright (c) 2026 mcelikx
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+ADDITIONAL NOTICE — AUTOMATED TRADING
+
+This repository contains design material for an automated trading system.
+The MIT terms above grant broad permission to use and modify it; they do not
+and cannot grant permission to trade.
+
+Deploying automated order entry against a live market venue requires, at
+minimum: broker-dealer registration or sponsored market access, exchange
+conformance certification, pre-trade risk controls satisfying SEC Rule 15c3-5,
+and compliance with Regulation NMS, Regulation SHO, the LULD Plan, and CAT
+reporting obligations. None of that is conferred by this licence.
+
+Nothing here has been compiled, simulated, or run on hardware, and nothing has
+been reviewed by a compliance professional. Automated trading systems can lose
+money faster than a human can react. See the disclaimer in README.md.
+
+Exchange specifications, regulatory rules, and fee schedules referenced in this
+repository change over time. Figures are marked "Verify:" with their
+authoritative source. Confirm against the primary document before relying on
+any of them.
