@@ -1,0 +1,72 @@
+name: Validate
+
+# Structural validation of the repository. This does NOT prove the design is
+# correct or fast — that needs simulation against the golden model and a
+# post-route timing report, neither of which runs here.
+#
+# It proves the tree is internally consistent: every module the top level
+# instantiates exists, the RTL obeys the coding rules in CLAUDE.md, and
+# cross-references resolve.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Repository consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Broken links are ignored as a build gate because manual tiers 10 and 11
+      # are knowingly incomplete — the count is reported below so the gap stays
+      # visible rather than being silently tolerated.
+      - name: Validate structure
+        run: |
+          python3 scripts/validate.py \
+            --quiet \
+            --html docs/validation-report.html \
+            --ignore-category broken-link
+
+      - name: Report metrics
+        if: always()
+        run: |
+          python3 scripts/validate.py 2>/dev/null \
+            | python3 scripts/ci_summary.py >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report
+          path: docs/validation-report.html
+          retention-days: 30
+
+  lint:
+    name: RTL lint
+    runs-on: ubuntu-latest
+    # Verilator is not yet clean across the tree — this reports rather than
+    # gates. Flip continue-on-error off once `scripts/lint.sh` passes.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Verilator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator
+          verilator --version
+
+      - name: Lint
+        run: ./scripts/lint.sh

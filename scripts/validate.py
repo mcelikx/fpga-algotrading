@@ -494,8 +494,23 @@ def main(argv: list[str]) -> int:
     if "--quiet" not in argv:
         print(json.dumps(asdict(rep), indent=2))
 
-    n_err = sum(1 for f in rep.findings if f["severity"] == "error")
-    return 1 if n_err else 0
+    # CI gates on structural defects. Broken links to manual tiers that are
+    # knowingly incomplete are tracked but must not block a build — pass
+    # `--ignore-category broken-link` to separate the two.
+    ignored: set[str] = set()
+    while "--ignore-category" in argv:
+        i = argv.index("--ignore-category")
+        ignored.add(argv[i + 1])
+        del argv[i:i + 2]
+
+    errors = [f for f in rep.findings
+              if f["severity"] == "error" and f["category"] not in ignored]
+    if errors:
+        print(f"\n{len(errors)} blocking finding(s):", file=sys.stderr)
+        for f in errors[:20]:
+            print(f"  {f['category']}: {f['location']} — {f['message']}",
+                  file=sys.stderr)
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
