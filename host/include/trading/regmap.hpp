@@ -162,7 +162,9 @@ inline constexpr std::uint32_t REGMAP_VER_VALUE =
 // IDENT_CAPS field layout:
 //   [7:0]   log2(N_SYMBOLS)
 //   [15:8]  log2(N_ACTIVE)
-//   [23:16] BOOK_LEVELS
+//   [23:16] log2(BOOK_LEVELS)   <- log2, not the raw value: 2048 does
+//                                  not fit 8 bits. Consistent with the
+//                                  two fields above, which are log2 too.
 //   [31:24] N_RISK_REASONS
 namespace caps {
 inline constexpr unsigned LOG2_N_SYMBOLS_SHIFT = 0;

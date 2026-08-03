@@ -58,7 +58,11 @@ TIERS = {
     "docs":                         ("Design docs", "docs"),
 }
 
-SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", "build", "sim_build"}
+SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", "build",
+             "sim_build", "obj_dir",
+             # Third-party clones kept locally for study. Not ours, not our
+             # licence, not our coding standard — see docs/REFERENCE-*.md
+             "reference"}
 
 # ── Modules the top level declares. The contract check compares against these. ─
 def declared_modules(top: Path) -> list[str]:
@@ -405,6 +409,83 @@ def check_coverage(rep: Report) -> None:
     }
 
 
+# ── 5b. Mirror consistency ───────────────────────────────────────────────────
+# The host software and the testbenches hand-copy geometry constants out of
+# trading_pkg.sv. When BOOK_LEVELS went 16 -> 2048, FIVE files kept the old
+# value and nothing complained — a golden-model comparison against a 16-level
+# software book and a 2048-level hardware book would have "passed" while
+# comparing two different machines. That is the worst kind of test: one that
+# reports success for a reason unrelated to correctness.
+MIRRORED = ["BOOK_LEVELS", "N_ACTIVE", "N_SYMBOLS", "ORDER_MAP_ENTRIES", "TOKEN_W"]
+
+MIRROR_FILES = [
+    "host/include/trading/types.hpp",
+    "host/pymodel/trading_pkg_mirror.py",
+    "tb/common/tb_util.py",
+]
+
+
+def check_mirrors(rep: Report) -> None:
+    pkg = ROOT / "rtl" / "pkg" / "trading_pkg.sv"
+    if not pkg.exists():
+        return
+    text = pkg.read_text(errors="replace")
+
+    def as_int(expr: str) -> int | None:
+        """Evaluate the small set of constant forms these files actually use.
+
+        Both sides write `1 << 16` as often as `65536`, and a naive `(\\d+)`
+        capture reads that as 1 — which produced three confident false
+        mismatches on first run. A checker that misreads the code it checks is
+        worse than no checker, so parse the shift form explicitly rather than
+        grabbing the first digits and hoping.
+        """
+        e = expr.strip().rstrip(";").strip()
+        e = re.sub(r"\b(\d+)[uU]\b", r"\1", e)          # C++ `1u`
+        m_shift = re.fullmatch(r"(\d+)\s*<<\s*(\d+)", e)
+        if m_shift:
+            return int(m_shift.group(1)) << int(m_shift.group(2))
+        if re.fullmatch(r"\d+", e):
+            return int(e)
+        return None                                      # anything else: skip
+
+    truth: dict[str, int] = {}
+    for name in MIRRORED:
+        m = re.search(rf"parameter\s+int\s+unsigned\s+{name}\s*=\s*([^;]+);", text)
+        if m:
+            v = as_int(m.group(1))
+            if v is not None:
+                truth[name] = v
+
+    checked = mismatched = 0
+    for rel in MIRROR_FILES:
+        p = ROOT / rel
+        if not p.exists():
+            continue
+        body = p.read_text(errors="replace")
+        for name, want in truth.items():
+            # Capture the whole right-hand side, then evaluate it the same way
+            # as the RTL side — never compare a parsed value against a raw one.
+            m = re.search(rf"^[^\n#/]*\b{name}\b\s*(?::\s*\w+\s*)?=\s*([^;\n#]+)",
+                          body, re.M)
+            if not m:
+                continue
+            got = as_int(m.group(1))
+            if got is None:
+                continue
+            checked += 1
+            if got != want:
+                mismatched += 1
+                rep.findings.append(asdict(Finding(
+                    "error", "mirror-drift", rel,
+                    f"{name} = {got} but rtl/pkg/trading_pkg.sv says {want} — "
+                    "a mirror that disagrees with the RTL makes every comparison "
+                    "against it meaningless")))
+
+    rep.totals["mirrors_checked"] = checked
+    rep.totals["mirrors_mismatched"] = mismatched
+
+
 # ── 6. Requirements traceability ─────────────────────────────────────────────
 # Each entry: (requirement as the user stated it, list of glob patterns that
 # satisfy it, minimum count to consider it met).
@@ -483,6 +564,7 @@ def main(argv: list[str]) -> int:
     check_rtl(files, rep)
     check_contract(rep)
     check_coverage(rep)
+    check_mirrors(rep)
     check_requirements(rep)
 
     if "--html" in argv:

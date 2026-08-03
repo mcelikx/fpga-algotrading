@@ -80,8 +80,8 @@ inline constexpr std::uint32_t N_ACTIVE = 256;    // filtered / active set
 inline constexpr std::uint32_t ACT_IDX_W = 8;     // $clog2(N_ACTIVE)
 
 // mirrors trading_pkg::BOOK_LEVELS / LEVEL_IDX_W
-inline constexpr std::uint32_t BOOK_LEVELS = 16;
-inline constexpr std::uint32_t LEVEL_IDX_W = 4;
+inline constexpr std::uint32_t BOOK_LEVELS = 2048;
+inline constexpr std::uint32_t LEVEL_IDX_W = 11;
 
 // mirrors trading_pkg::ORDER_MAP_ENTRIES / ORDER_MAP_WAYS
 inline constexpr std::uint32_t ORDER_MAP_ENTRIES = 1u << 16;
